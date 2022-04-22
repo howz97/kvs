@@ -8,6 +8,12 @@ pub struct KvStore {
     table: HashMap<String, String>,
 }
 
+impl Default for KvStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KvStore {
     /// Creates a new instance of an `KvStore`.
     ///
@@ -55,11 +61,7 @@ impl KvStore {
     /// # }
     /// ```
     pub fn get(&self, key: String) -> Option<String> {
-        if let Some(s) = self.table.get(&key) {
-            Some(s.clone().to_string())
-        } else {
-            None
-        }
+        self.table.get(&key).cloned()
     }
 
     /// Remove value by key
