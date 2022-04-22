@@ -2,10 +2,10 @@ use clap::{Arg, Command};
 use std::process::exit;
 
 fn main() {
-    let m = Command::new("kvs")
-        .author("howz97, <964701944@qq.com>")
-        .version("v0.1.0")
-        .about("Key value store")
+    let m = Command::new(env!("CARGO_PKG_NAME"))
+        .author(env!("CARGO_PKG_AUTHORS"))
+        .version(env!("CARGO_PKG_VERSION"))
+        .about(env!("CARGO_PKG_DESCRIPTION"))
         .subcommands(vec![
             Command::new("set")
                 .about("Insert/Update key value")
@@ -20,10 +20,6 @@ fn main() {
         .after_help("--Over--")
         .get_matches();
 
-    if let Some(_) = m.value_of("version") {
-        println!("kvs v0.1.0");
-        exit(0);
-    }
     match m.subcommand() {
         Some(("set", _)) => {
             eprintln!("unimplemented");
