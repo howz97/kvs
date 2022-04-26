@@ -1,7 +1,8 @@
 use clap::{Arg, Command};
+use kvs::Result;
 use std::process::exit;
 
-fn main() {
+fn main() -> Result<()> {
     let m = Command::new(env!("CARGO_PKG_NAME"))
         .author(env!("CARGO_PKG_AUTHORS"))
         .version(env!("CARGO_PKG_VERSION"))
