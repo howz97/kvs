@@ -1,22 +1,27 @@
 // #![deny(missing_docs)]
 //! This is key-value store lib
 
-use failure::Error;
+use failure;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
-use std::fs::{File, read_dir};
+use std::error::Error;
+use std::fmt;
+use std::fs::{read_dir, rename, File};
 use std::io;
-use std::io::{Read, Seek};
-use std::path::{PathBuf, Path};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 use std::result;
 
 /// KvStore is the core data structure keeping all KV pairs
 pub struct KvStore {
     table: HashMap<String, Index>,
-    active_file: File,
+    active_file: File, // todo: wrap buffer
+    older_files: Vec<File>,
+    dir_path: PathBuf,
 }
 
+#[derive(Debug)]
 pub struct Index {
     file: u32,
     offset: u32,
@@ -28,30 +33,7 @@ impl Index {
     }
 }
 
-impl Default for KvStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl KvStore {
-    /// Creates a new instance of an `KvStore`.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # use kvs::KvStore;
-    /// # fn main() {
-    /// #   let mut store = KvStore::new();
-    /// #   store.set("a".to_string(), "A".to_string());
-    /// # }
-    /// ```
-    pub fn new() -> Self {
-        KvStore {
-            table: HashMap::new(),
-        }
-    }
-
     /// Insert/Update key-value
     ///
     /// # Example
@@ -64,9 +46,13 @@ impl KvStore {
     /// # }
     /// ```
     pub fn set(&mut self, key: String, val: String) -> Result<()> {
-        let cmd = Command::put(key, val);
-        let offset = 
-        Result::Ok(())
+        let offset = self.active_file.stream_position()? as u32;
+        let cmd = serde_json::to_vec(&Command::put(key.clone(), val))?;
+        let cmd_len = cmd.len() as u32;
+        self.active_file.write_all(&cmd_len.to_be_bytes())?;
+        self.active_file.write_all(&cmd)?;
+        self.table.insert(key, Index::new(0, offset));
+        Ok(())
     }
 
     /// Get value by key
@@ -82,8 +68,15 @@ impl KvStore {
     /// #   }
     /// # }
     /// ```
-    pub fn get(&self, key: String) -> Result<Option<String>> {
-        Result::Ok(self.table.get(&key).cloned())
+    pub fn get(&mut self, key: String) -> Result<Option<String>> {
+        if let Some(idx) = self.table.get(&key) {
+            let mut file = self.older_files.get_mut(idx.file as usize).unwrap();
+            file.seek(SeekFrom::Start(idx.offset as u64))?;
+            let cmd = read_cmd(&mut file)?;
+            Ok(Some(cmd.val))
+        } else {
+            return Ok(None);
+        }
     }
 
     /// Remove value by key
@@ -98,44 +91,85 @@ impl KvStore {
     /// # }
     /// ```
     pub fn remove(&mut self, key: String) -> Result<()> {
-        self.table.remove(&key);
-        Result::Ok(())
+        self.table.remove(&key).ok_or(MyErr::KeyNotFound)?;
+        let cmd = serde_json::to_vec(&Command::del(key.clone()))?;
+        let cmd_len = cmd.len() as u32;
+        self.active_file.write_all(&cmd_len.to_be_bytes())?;
+        self.active_file.write_all(&cmd)?;
+        Ok(())
     }
 
     pub fn open(path: impl Into<PathBuf>) -> Result<KvStore> {
-        let dir = read_dir(path.into())?
-        .map(|res| res.map(|e| e.path()))
-        .collect::<result::Result<Vec<_>, io::Error>>()?;
-        dir.sort();
-        for e in dir {
+        let dir_path = path.into();
+        let mut dir = read_dir(dir_path.clone())?
+            .map(|res| res.map(|e| e.path()))
+            .filter(|res| {
+                if let Ok(p) = res {
+                    if p.extension().unwrap() == "kvs" {
+                        return true;
+                    }
+                }
+                false
+            })
+            .collect::<result::Result<Vec<_>, io::Error>>()?;
 
-        }
-        // todo
-        let file = File::open(path.into())?;
-        let file_len = file.metadata()?.len() as u32;
-        let offset: u32 = 0;
-        let store = KvStore::default();
-        while offset < file_len {
-            let mut cmd_len = [0; 4];
-            file.read_exact(&mut cmd_len)?;
-            let cmd_len = u32::from_be_bytes(cmd_len);
-            let mut cmd = vec![0; cmd_len as usize];
-            file.read_exact(&mut cmd);
-            let cmd: Command = serde_json::from_slice(&cmd)?;
-            if !cmd.is_del {
-                store.table.insert(cmd.key, Index::new(0, offset));
-            } else {
-                store.table.remove(&cmd.key);
+        dir.sort();
+        let mut table = HashMap::new();
+        let mut older = Vec::new();
+        for (i, e) in dir.iter().enumerate() {
+            let mut file = File::open(e)?;
+            let file_len = file.metadata()?.len() as u32;
+            let mut offset: u32 = 0;
+            while offset < file_len {
+                let cmd = read_cmd(&mut file)?;
+                if !cmd.is_del {
+                    table.insert(cmd.key, Index::new(i as u32, offset));
+                } else {
+                    table.remove(&cmd.key);
+                }
+                offset = file.stream_position()? as u32;
             }
-            let offset = file.stream_position()? as u32;
+            older.push(file);
         }
+
+        let mut active_path = dir_path.clone();
+        active_path.push("active.kvs");
+        let store = KvStore {
+            table: table,
+            active_file: File::options()
+                .append(true)
+                .create_new(true)
+                .open(active_path.as_path())?,
+            older_files: older,
+            dir_path: dir_path,
+        };
         Ok(store)
     }
 }
 
-pub type Result<T> = result::Result<T, Error>;
+impl Drop for KvStore {
+    fn drop(&mut self) {
+        let mut from = self.dir_path.clone();
+        from.push("active.kvs");
+        let mut to = self.dir_path.clone();
+        to.push(format!("{}_older.kvs", self.older_files.len()));
+        rename(from, to).expect("failed to rename active file");
+    }
+}
 
-#[derive(Deserialize, Debug)]
+fn read_cmd(file: &mut File) -> Result<Command> {
+    let mut cmd_len = [0; 4];
+    file.read_exact(&mut cmd_len)?;
+    let cmd_len = u32::from_be_bytes(cmd_len);
+    let mut cmd = vec![0; cmd_len as usize];
+    file.read_exact(&mut cmd)?;
+    let cmd: Command = serde_json::from_slice(&cmd)?;
+    Ok(cmd)
+}
+
+pub type Result<T> = result::Result<T, failure::Error>;
+
+#[derive(Serialize, Deserialize, Debug)]
 struct Command {
     key: String,
     val: String,
@@ -153,3 +187,18 @@ impl Command {
         Command { key, val, is_del }
     }
 }
+
+#[derive(Debug)]
+pub enum MyErr {
+    KeyNotFound,
+}
+
+impl fmt::Display for MyErr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            MyErr::KeyNotFound => write!(f, "Key not found"),
+        }
+    }
+}
+
+impl Error for MyErr {}

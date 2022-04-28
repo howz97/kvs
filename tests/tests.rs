@@ -19,7 +19,7 @@ fn cli_version() {
         .unwrap()
         .args(&["-V"])
         .assert()
-        .stdout(contains(env!("CARGO_PKG_VERSION")));
+        .stderr(contains(env!("CARGO_PKG_VERSION")));
 }
 
 // `kvs get <KEY>` should print "Key not found" for a non-existent key and exit with zero.
