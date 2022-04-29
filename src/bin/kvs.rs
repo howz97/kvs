@@ -1,5 +1,5 @@
 use clap::{Arg, Command};
-use kvs::{KvStore, MyErr, Result};
+use kvs::{KvStore, Result};
 use std::process::exit;
 
 const ARG_KEY: &str = "key";
@@ -39,7 +39,7 @@ fn main() -> Result<()> {
             let key = sub_m.value_of(ARG_KEY).unwrap().to_owned();
             let opt_val = store.get(key)?;
             if let Some(val) = opt_val {
-                print!("{:?}", val);
+                print!("{}", val);
             } else {
                 println!("Key not found");
             }

@@ -39,10 +39,12 @@ impl KvStore {
     /// # Example
     ///
     /// ```rust
-    /// # use kvs::KvStore;
-    /// # fn main() {
-    /// #   let mut store = KvStore::new();
-    /// #   store.set("a".to_string(), "A".to_string());
+    /// # use kvs::{KvStore, Result};
+    /// # use tempfile::TempDir;
+    /// # fn main() -> Result<()> {
+    /// #   let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+    /// #   let mut store = KvStore::open(temp_dir.path())?;
+    /// #   store.set("a".to_string(), "A".to_string())
     /// # }
     /// ```
     pub fn set(&mut self, key: String, val: String) -> Result<()> {
@@ -51,7 +53,8 @@ impl KvStore {
         let cmd_len = cmd.len() as u32;
         self.active_file.write_all(&cmd_len.to_be_bytes())?;
         self.active_file.write_all(&cmd)?;
-        self.table.insert(key, Index::new(0, offset));
+        self.table
+            .insert(key, Index::new(self.older_files.len() as u32, offset));
         Ok(())
     }
 
@@ -60,17 +63,25 @@ impl KvStore {
     /// # Example
     ///
     /// ```rust
-    /// # use kvs::KvStore;
-    /// # fn main() {
-    /// #   let mut store = KvStore::new();
-    /// #   if let Some(v) = store.get("a".to_string()) {
+    /// # use kvs::{KvStore, Result};
+    /// # use tempfile::TempDir;
+    /// # fn main() -> Result<()> {
+    /// #   let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+    /// #   let mut store = KvStore::open(temp_dir.path())?;
+    /// #   if let Some(v) = store.get("a".to_string())? {
     /// #       println!("{}", v)
     /// #   }
+    /// #   Ok(())
     /// # }
     /// ```
     pub fn get(&mut self, key: String) -> Result<Option<String>> {
         if let Some(idx) = self.table.get(&key) {
-            let mut file = self.older_files.get_mut(idx.file as usize).unwrap();
+            let mut file;
+            if idx.file == self.older_files.len() as u32 {
+                file = &mut self.active_file
+            } else {
+                file = self.older_files.get_mut(idx.file as usize).unwrap();
+            }
             file.seek(SeekFrom::Start(idx.offset as u64))?;
             let cmd = read_cmd(&mut file)?;
             Ok(Some(cmd.val))
@@ -84,10 +95,13 @@ impl KvStore {
     /// # Example
     ///
     /// ```rust
-    /// # use kvs::KvStore;
-    /// # fn main() {
-    /// #   let mut store = KvStore::new();
-    /// #   store.remove("a".to_string());
+    /// # use kvs::{KvStore, Result};
+    /// # use tempfile::TempDir;
+    /// # fn main() -> Result<()> {
+    /// #   let temp_dir = TempDir::new().expect("unable to create temporary working directory");
+    /// #   let mut store = KvStore::open(temp_dir.path())?;
+    /// #   store.set("a".to_string(), "A".to_string())?;
+    /// #   store.remove("a".to_string())
     /// # }
     /// ```
     pub fn remove(&mut self, key: String) -> Result<()> {
@@ -137,6 +151,7 @@ impl KvStore {
         let store = KvStore {
             table: table,
             active_file: File::options()
+                .read(true)
                 .append(true)
                 .create_new(true)
                 .open(active_path.as_path())?,
