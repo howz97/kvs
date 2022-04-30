@@ -7,7 +7,7 @@ use serde_json;
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
-use std::fs::{read_dir, rename, File};
+use std::fs::{read_dir, remove_file, rename, File};
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -90,9 +90,7 @@ impl KvStore {
                 .open(path.clone())
                 .expect("failed to create compacting file");
             // todo: choose files to compact
-            let mut iter = self.older_files.keys().take(4);
-            while let Some(id) = iter.next() {
-                let mut file = self.older_files.remove(id).unwrap();
+            while let Some((id, file)) = self.older_files.iter_mut().take(4).next() {
                 let compact_log = |offset, cmd: Command| {
                     let mut keep = false;
                     let opt_idx = self.table.get(&cmd.key);
@@ -112,8 +110,15 @@ impl KvStore {
                         append_cmd(&mut compacted, cmd).expect("failed to write");
                     }
                 };
-                iter_cmds(&mut file, compact_log);
-                // todo: remove files on disk
+                iter_cmds(file, compact_log);
+            }
+            let mut keys = Vec::new();
+            while let Some(&id) = self.older_files.keys().take(4).next() {
+                keys.push(id);
+            }
+            for id in keys {
+                self.older_files.remove(&id);
+                remove_file(format!("{}.kvs", id)).unwrap();
             }
             let mut to_path = self.dir_path.clone();
             to_path.push("1.kvs");
