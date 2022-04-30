@@ -4,7 +4,7 @@
 use failure;
 use serde::{Deserialize, Serialize};
 use serde_json;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
 use std::fs::{read_dir, rename, File};
@@ -13,17 +13,21 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::result;
 
+const SEGMENT_SIZE: u64 = 1 << 20;
+const COMPACT_THRESHOLD: usize = 10;
+
 /// KvStore is the core data structure keeping all KV pairs
 pub struct KvStore {
     table: HashMap<String, Index>,
-    active_file: File, // todo: wrap buffer
-    older_files: Vec<File>,
+    older_files: BTreeMap<u32, File>,
+    active_file: File,
+    active_id: u32,
     dir_path: PathBuf,
 }
 
 #[derive(Debug)]
 pub struct Index {
-    file: u32,
+    file: u32, // file_id
     offset: u32,
 }
 
@@ -49,13 +53,72 @@ impl KvStore {
     /// ```
     pub fn set(&mut self, key: String, val: String) -> Result<()> {
         let offset = self.active_file.stream_position()? as u32;
-        let cmd = serde_json::to_vec(&Command::put(key.clone(), val))?;
-        let cmd_len = cmd.len() as u32;
-        self.active_file.write_all(&cmd_len.to_be_bytes())?;
-        self.active_file.write_all(&cmd)?;
-        self.table
-            .insert(key, Index::new(self.older_files.len() as u32, offset));
+        append_cmd(&mut self.active_file, Command::put(key.clone(), val))?;
+        self.table.insert(key, Index::new(self.active_id, offset));
+        self.maybe_cut();
         Ok(())
+    }
+
+    fn maybe_cut(&mut self) {
+        if self
+            .active_file
+            .metadata()
+            .expect("active file metadata unknown")
+            .len()
+            >= SEGMENT_SIZE
+        {
+            let older = self
+                .rename_active()
+                .expect("failed to rename active file when drop KvStore");
+            self.active_file =
+                new_active_file(self.dir_path.clone()).expect("failed to create active file");
+            self.older_files
+                .insert(self.active_id, File::open(older).unwrap());
+            self.active_id += 1;
+            self.maybe_compaction();
+        }
+    }
+
+    fn maybe_compaction(&mut self) {
+        if self.older_files.len() >= COMPACT_THRESHOLD {
+            // todo: trigger by size of file contents
+            let mut path = self.dir_path.clone();
+            path.push("compacting.kvs");
+            let mut compacted = File::options()
+                .append(true)
+                .create_new(true)
+                .open(path.clone())
+                .expect("failed to create compacting file");
+            // todo: choose files to compact
+            let mut iter = self.older_files.keys().take(4);
+            while let Some(id) = iter.next() {
+                let mut file = self.older_files.remove(id).unwrap();
+                let compact_log = |offset, cmd: Command| {
+                    let mut keep = false;
+                    let opt_idx = self.table.get(&cmd.key);
+                    if cmd.is_del {
+                        if opt_idx.is_none() {
+                            // maybe a put command exists in previous log
+                            keep = true;
+                        }
+                    } else {
+                        if let Some(idx) = opt_idx {
+                            if idx.file == *id && idx.offset == offset {
+                                keep = true;
+                            }
+                        }
+                    }
+                    if keep {
+                        append_cmd(&mut compacted, cmd).expect("failed to write");
+                    }
+                };
+                iter_cmds(&mut file, compact_log);
+                // todo: remove files on disk
+            }
+            let mut to_path = self.dir_path.clone();
+            to_path.push("1.kvs");
+            rename(path, to_path).expect("compaction failed");
+        }
     }
 
     /// Get value by key
@@ -77,10 +140,10 @@ impl KvStore {
     pub fn get(&mut self, key: String) -> Result<Option<String>> {
         if let Some(idx) = self.table.get(&key) {
             let mut file;
-            if idx.file == self.older_files.len() as u32 {
+            if idx.file == self.active_id {
                 file = &mut self.active_file
             } else {
-                file = self.older_files.get_mut(idx.file as usize).unwrap();
+                file = self.older_files.get_mut(&idx.file).unwrap();
             }
             file.seek(SeekFrom::Start(idx.offset as u64))?;
             let cmd = read_cmd(&mut file)?;
@@ -106,10 +169,8 @@ impl KvStore {
     /// ```
     pub fn remove(&mut self, key: String) -> Result<()> {
         self.table.remove(&key).ok_or(MyErr::KeyNotFound)?;
-        let cmd = serde_json::to_vec(&Command::del(key.clone()))?;
-        let cmd_len = cmd.len() as u32;
-        self.active_file.write_all(&cmd_len.to_be_bytes())?;
-        self.active_file.write_all(&cmd)?;
+        append_cmd(&mut self.active_file, Command::del(key.clone()))?;
+        self.maybe_cut();
         Ok(())
     }
 
@@ -129,46 +190,71 @@ impl KvStore {
 
         dir.sort();
         let mut table = HashMap::new();
-        let mut older = Vec::new();
-        for (i, e) in dir.iter().enumerate() {
+        let mut older = BTreeMap::new();
+        let mut file_id: u32 = 0;
+        for e in dir.iter() {
+            file_id = e
+                .file_stem()
+                .expect("invalid file")
+                .to_str()
+                .unwrap()
+                .parse()?;
             let mut file = File::open(e)?;
-            let file_len = file.metadata()?.len() as u32;
-            let mut offset: u32 = 0;
-            while offset < file_len {
-                let cmd = read_cmd(&mut file)?;
+            let handle_log = |offset, cmd: Command| {
                 if !cmd.is_del {
-                    table.insert(cmd.key, Index::new(i as u32, offset));
+                    table.insert(cmd.key, Index::new(file_id, offset));
                 } else {
                     table.remove(&cmd.key);
                 }
-                offset = file.stream_position()? as u32;
-            }
-            older.push(file);
+            };
+            iter_cmds(&mut file, handle_log);
+            older.insert(file_id, file);
         }
 
-        let mut active_path = dir_path.clone();
-        active_path.push("active.kvs");
         let store = KvStore {
             table: table,
-            active_file: File::options()
-                .read(true)
-                .append(true)
-                .create_new(true)
-                .open(active_path.as_path())?,
             older_files: older,
+            active_file: new_active_file(dir_path.clone())?,
+            active_id: file_id + 1,
             dir_path: dir_path,
         };
         Ok(store)
     }
+
+    fn rename_active(&self) -> Result<PathBuf> {
+        let mut from = self.dir_path.clone();
+        from.push("active.kvs");
+        let mut to = self.dir_path.clone();
+        to.push(format!("{}.kvs", self.active_id));
+        rename(from, to.clone())?;
+        Ok(to)
+    }
+}
+
+fn new_active_file(mut path: PathBuf) -> Result<File> {
+    path.push("active.kvs");
+    let file = File::options()
+        .read(true)
+        .append(true)
+        .create_new(true)
+        .open(path)?;
+    Ok(file)
 }
 
 impl Drop for KvStore {
     fn drop(&mut self) {
-        let mut from = self.dir_path.clone();
-        from.push("active.kvs");
-        let mut to = self.dir_path.clone();
-        to.push(format!("{}_older.kvs", self.older_files.len()));
-        rename(from, to).expect("failed to rename active file");
+        self.rename_active()
+            .expect("failed to rename active file when drop KvStore");
+    }
+}
+
+fn iter_cmds<F: FnMut(u32, Command)>(file: &mut File, mut f: F) {
+    let file_len = file.metadata().unwrap().len() as u32;
+    let mut offset: u32 = 0;
+    while offset < file_len {
+        let cmd = read_cmd(file).unwrap();
+        f(offset, cmd);
+        offset = file.stream_position().unwrap() as u32;
     }
 }
 
@@ -180,6 +266,14 @@ fn read_cmd(file: &mut File) -> Result<Command> {
     file.read_exact(&mut cmd)?;
     let cmd: Command = serde_json::from_slice(&cmd)?;
     Ok(cmd)
+}
+
+fn append_cmd(file: &mut File, cmd: Command) -> Result<()> {
+    let cmd = serde_json::to_vec(&cmd)?;
+    let cmd_len = cmd.len() as u32;
+    file.write_all(&cmd_len.to_be_bytes())?;
+    file.write_all(&cmd)?;
+    Ok(())
 }
 
 pub type Result<T> = result::Result<T, failure::Error>;
