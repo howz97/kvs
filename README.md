@@ -1,1 +1,1 @@
-kvs is key-value store written in Rust and uses bitcask to improve efficiency
+kvs is key-value store written in Rust and uses bitcask to improve performance
