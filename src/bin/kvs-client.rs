@@ -10,7 +10,7 @@ const CMD_GET: &str = "get";
 const CMD_RM: &str = "rm";
 
 fn main() -> Result<()> {
-    let m = Command::new(env!("CARGO_PKG_NAME"))
+    let m = Command::new("kvs-client")
         .author(env!("CARGO_PKG_AUTHORS"))
         .version(env!("CARGO_PKG_VERSION"))
         .about(env!("CARGO_PKG_DESCRIPTION"))
