@@ -1,5 +1,6 @@
 use clap::{Arg, Command};
 use kvs::{KvStore, Result};
+use std::net::TcpStream;
 use std::process::exit;
 
 const ARG_KEY: &str = "key";
@@ -28,16 +29,16 @@ fn main() -> Result<()> {
         .after_help("--Over--")
         .get_matches();
 
-    let mut store = KvStore::open(".\\")?;
+    let mut stream = TcpStream::connect("127.0.0.1:4000")?;
     match m.subcommand() {
         Some((CMD_SET, sub_m)) => {
             let key = sub_m.value_of(ARG_KEY).unwrap().to_owned();
             let val = sub_m.value_of(ARG_VAL).unwrap().to_owned();
-            store.set(key, val)
+            set(&mut stream, key, val)
         }
         Some((CMD_GET, sub_m)) => {
             let key = sub_m.value_of(ARG_KEY).unwrap().to_owned();
-            let opt_val = store.get(key)?;
+            let opt_val = get(&mut stream, key)?;
             if let Some(val) = opt_val {
                 print!("{}", val);
             } else {
@@ -47,7 +48,7 @@ fn main() -> Result<()> {
         }
         Some((CMD_RM, sub_m)) => {
             let key = sub_m.value_of(ARG_KEY).unwrap().to_owned();
-            let result = store.remove(key);
+            let result = remove(&mut stream, key);
             if let Err(e) = result {
                 println!("{}", e);
                 exit(1);
@@ -60,3 +61,9 @@ fn main() -> Result<()> {
         }
     }
 }
+
+fn set(stream: &mut TcpStream, key: String, val: String) -> Result<()> {}
+
+fn get(stream: &mut TcpStream, key: String) -> Result<Option<String>> {}
+
+fn remove(stream: &mut TcpStream, key: String) -> Result<()> {}

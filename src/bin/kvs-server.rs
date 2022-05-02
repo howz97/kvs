@@ -1,3 +1,5 @@
+mod protocol;
+
 use clap::{Arg, Command};
 use kvs::{KvStore, Result};
 use std::io::{self, BufRead, Read, Write};
@@ -6,7 +8,6 @@ use tracing::{debug, error, info, trace};
 use tracing_subscriber;
 
 static x: &[char] = &['\n', '\t', ' '];
-static store: KvStore = KvStore::open(".\\testdata").expect("open should't failed");
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -22,17 +23,20 @@ fn main() -> Result<()> {
     let engine = m.value_of("engine").unwrap();
     info!(addr, engine, "kvs-server start...");
 
+    let mut store = KvStore::open(".\\testdata")?;
     let listener = TcpListener::bind(addr)?;
     // accept connections and process them serially
     for stream in listener.incoming() {
-        if let Err(e) = handle_client(stream?) {
+        debug!("connected");
+        if let Err(e) = handle_client(stream?, &mut store) {
             error!(e, "TCP is disconnected")
         }
     }
+    info!("kvs-server shutdown!");
     Ok(())
 }
 
-fn handle_client(mut stream: TcpStream) -> Result<()> {
+fn handle_client(mut stream: TcpStream, store: &mut KvStore) -> Result<()> {
     let mut rdr = io::BufReader::new(stream.try_clone().unwrap());
     let mut op = [0; 1];
     loop {
@@ -75,16 +79,19 @@ fn handle_client(mut stream: TcpStream) -> Result<()> {
                 rdr.read_line(&mut key)?;
                 key.trim_matches(x);
                 if key.len() == 0 {
+                    stream.write(protocol::get_err)?;
                     stream.write_all("ErrNoKey".as_bytes())?;
                 }
                 let res = store.get(key);
                 if let Err(e) = res {
+                    stream.write(protocol::get_err)?;
                     stream.write_all("ErrInternal".as_bytes())?;
                 } else {
                     if let Some(v) = res.unwrap() {
+                        stream.write(protocol::get_val)?;
                         stream.write_all(v.as_bytes())?;
                     } else {
-                        stream.write_all("Nil".as_bytes())?;
+                        stream.write_all(protocol::get_nil)?;
                     }
                 }
             }
