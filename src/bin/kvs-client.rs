@@ -1,9 +1,10 @@
 use clap::{Arg, Command};
 use kvs::protocol;
-use kvs::{MyErr, Result};
+use kvs::Result;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::TcpStream;
 use std::process::exit;
+use tracing::error;
 
 const ARG_KEY: &str = "key";
 const ARG_VAL: &str = "value";
@@ -63,10 +64,8 @@ fn main() -> Result<()> {
         Some((CMD_RM, sub_m)) => {
             let mut client = Client::new(TcpStream::connect(sub_m.value_of("addr").unwrap())?);
             let key = sub_m.value_of(ARG_KEY).unwrap().to_owned();
-            let result = client.remove(key);
-            if let Err(e) = result {
-                println!("{}", e);
-                exit(1);
+            if let Err(e) = client.remove(key) {
+                error!("error={} on remove", e.to_string());
             }
             Ok(())
         }
@@ -110,7 +109,7 @@ impl Client {
         self.reader.read_line(&mut ret)?;
         if ret.contains("Key not found") {
             eprintln!("Key not found");
-            Err(MyErr::KeyNotFound)?
+            exit(1);
         }
         Ok(())
     }

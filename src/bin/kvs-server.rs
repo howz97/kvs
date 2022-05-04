@@ -106,6 +106,7 @@ fn handle_client(stream: TcpStream, store: &mut Box<dyn KvsEngine>) -> Result<()
                     writer.write_all("ErrNoKey\n".as_bytes())?;
                     break;
                 }
+                debug!(key, "Removing");
                 if let Err(e) = store.remove(key) {
                     writer.write_all(e.to_string().as_bytes())?;
                     writer.write_all(&['\n' as u8])?;
