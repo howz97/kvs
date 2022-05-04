@@ -20,30 +20,38 @@ fn main() -> Result<()> {
         .subcommands(vec![
             Command::new(CMD_SET)
                 .about("Insert/Update key value")
-                .args(&[Arg::new(ARG_KEY), Arg::new(ARG_VAL)]),
+                .args(&[
+                    Arg::new(ARG_KEY),
+                    Arg::new(ARG_VAL),
+                    Arg::new("addr").default_value("127.0.0.1:4000"),
+                ]),
             Command::new(CMD_GET)
                 .about("Get value by key")
-                .arg(Arg::new(ARG_KEY)),
+                .arg(Arg::new(ARG_KEY))
+                .arg(Arg::new("addr").default_value("127.0.0.1:4000")),
             Command::new(CMD_RM)
                 .about("Remove value by key")
-                .arg(Arg::new(ARG_KEY)),
+                .arg(Arg::new(ARG_KEY))
+                .arg(Arg::new("addr").default_value("127.0.0.1:4000")),
         ])
         .after_help("--Over--")
         .get_matches();
 
-    let mut client = Client::new(TcpStream::connect("127.0.0.1:4000")?);
     match m.subcommand() {
         Some((CMD_SET, sub_m)) => {
+            let mut client = Client::new(TcpStream::connect(sub_m.value_of("addr").unwrap())?);
             let key = sub_m.value_of(ARG_KEY).unwrap().to_owned();
             let val = sub_m.value_of(ARG_VAL).unwrap().to_owned();
             client.set(key, val)
         }
         Some((CMD_GET, sub_m)) => {
+            let mut client = Client::new(TcpStream::connect(sub_m.value_of("addr").unwrap())?);
             let key = sub_m.value_of(ARG_KEY).unwrap().to_owned();
             client.get(key)?;
             Ok(())
         }
         Some((CMD_RM, sub_m)) => {
+            let mut client = Client::new(TcpStream::connect(sub_m.value_of("addr").unwrap())?);
             let key = sub_m.value_of(ARG_KEY).unwrap().to_owned();
             let result = client.remove(key);
             if let Err(e) = result {

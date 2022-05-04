@@ -1,10 +1,8 @@
-use crate::KvsEngine;
-use crate::Result;
+use crate::{KvsEngine, MyErr, Result};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::{BTreeMap, HashMap};
-use std::error::Error;
-use std::fmt;
+
 use std::fs::{read_dir, remove_file, rename, File};
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -297,18 +295,3 @@ impl Entry {
         Entry { key, val, is_del }
     }
 }
-
-#[derive(Debug)]
-pub enum MyErr {
-    KeyNotFound,
-}
-
-impl fmt::Display for MyErr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            MyErr::KeyNotFound => write!(f, "Key not found"),
-        }
-    }
-}
-
-impl Error for MyErr {}

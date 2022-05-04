@@ -1,13 +1,15 @@
 use clap::{Arg, Command};
 use kvs::my_engine;
 use kvs::protocol;
-use kvs::sled_engine;
-use kvs::{KvsEngine, Result};
+use kvs::sled_engine::SledKvEngine;
+use kvs::{KvsEngine, MyErr, Result};
+use std::fs::read_dir;
 use std::io::{self, BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info};
 use tracing_subscriber;
 
+const DEFAULT_DIR: &str = ".\\testdata";
 static X: &[char] = &['\n', '\t', ' '];
 
 fn main() -> Result<()> {
@@ -17,17 +19,36 @@ fn main() -> Result<()> {
         .version(env!("CARGO_PKG_VERSION"))
         .about(env!("CARGO_PKG_DESCRIPTION"))
         .arg(Arg::new("addr").default_value("127.0.0.1:4000"))
-        .arg(Arg::new("engine").default_value("kvs"))
+        .arg(Arg::new("engine").possible_values(["kvs", "sled"]))
         .after_help("--Over--")
         .get_matches();
     let addr = m.value_of("addr").unwrap();
-    let engine = m.value_of("engine").unwrap();
+    let engine = m.value_of("engine");
     info!(addr, engine, "kvs-server start...");
 
     let mut store: Box<dyn KvsEngine>;
-    if let Some(eng) = m.value_of("engine") {
-        store = Box::new(my_engine::KvStore::open(".\\testdata")?);
+    let mut eng = "kvs".to_owned();
+    if let Some(e) = m.value_of("engine") {
+        eng = e.to_owned();
     } else {
+        for entry in read_dir(DEFAULT_DIR)? {
+            eng = entry?
+                .path()
+                .extension()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
+            break;
+        }
+    }
+    if eng == "kvs" {
+        store = Box::new(my_engine::KvStore::open(DEFAULT_DIR)?);
+    } else if eng == "sled" {
+        store = Box::new(SledKvEngine::open(DEFAULT_DIR)?);
+    } else {
+        Err(MyErr::ErrExtension)?;
+        panic!("never execute")
     }
     let listener = TcpListener::bind(addr)?;
     // accept connections and process them serially
@@ -41,8 +62,9 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn handle_client(mut stream: TcpStream, store: &mut KvStore) -> Result<()> {
+fn handle_client(stream: TcpStream, store: &mut Box<dyn KvsEngine>) -> Result<()> {
     let mut reader = io::BufReader::new(stream.try_clone().unwrap());
+    let mut writer = io::BufWriter::new(stream);
     let mut op = [0; 1];
     loop {
         reader.read_exact(&mut op)?;
@@ -52,18 +74,20 @@ fn handle_client(mut stream: TcpStream, store: &mut KvStore) -> Result<()> {
                 reader.read_line(&mut key)?;
                 key = key.trim_matches(X).to_owned();
                 if key.len() == 0 {
-                    stream.write_all("ErrNoKey".as_bytes())?;
+                    writer.write_all("ErrNoKey\n".as_bytes())?;
+                    break;
                 }
                 let mut val = String::new();
                 reader.read_line(&mut val)?;
                 val = val.trim_matches(X).to_owned();
                 if val.len() == 0 {
-                    stream.write_all("ErrNoVal".as_bytes())?;
+                    writer.write_all("ErrNoVal\n".as_bytes())?;
+                    break;
                 }
                 if let Err(_) = store.set(key, val) {
-                    stream.write_all("ErrInternal".as_bytes())?;
+                    writer.write_all("ErrInternal\n".as_bytes())?;
                 } else {
-                    stream.write_all("OK".as_bytes())?;
+                    writer.write_all("OK\n".as_bytes())?;
                 }
             }
             protocol::OP_RM => {
@@ -71,12 +95,13 @@ fn handle_client(mut stream: TcpStream, store: &mut KvStore) -> Result<()> {
                 reader.read_line(&mut key)?;
                 key = key.trim_matches(X).to_owned();
                 if key.len() == 0 {
-                    stream.write_all("ErrNoKey".as_bytes())?;
+                    writer.write_all("ErrNoKey\n".as_bytes())?;
+                    break;
                 }
                 if let Err(_) = store.remove(key) {
-                    stream.write_all("ErrInternal".as_bytes())?;
+                    writer.write_all("ErrInternal\n".as_bytes())?;
                 } else {
-                    stream.write_all("OK".as_bytes())?;
+                    writer.write_all("OK\n".as_bytes())?;
                 }
             }
             protocol::OP_GET => {
@@ -84,25 +109,29 @@ fn handle_client(mut stream: TcpStream, store: &mut KvStore) -> Result<()> {
                 reader.read_line(&mut key)?;
                 key = key.trim_matches(X).to_owned();
                 if key.len() == 0 {
-                    stream.write(&[protocol::GET_ERR])?;
-                    stream.write_all("ErrNoKey".as_bytes())?;
+                    writer.write_all(&[protocol::GET_ERR])?;
+                    writer.write_all("ErrNoKey\n".as_bytes())?;
+                    break;
                 }
                 let res = store.get(key);
                 if let Err(_) = res {
-                    stream.write(&[protocol::GET_ERR])?;
-                    stream.write_all("ErrInternal".as_bytes())?;
+                    writer.write_all(&[protocol::GET_ERR])?;
+                    writer.write_all("ErrInternal\n".as_bytes())?;
                 } else {
                     if let Some(v) = res.unwrap() {
-                        stream.write(&[protocol::GET_VAL])?;
-                        stream.write_all(v.as_bytes())?;
+                        writer.write_all(&[protocol::GET_VAL])?;
+                        writer.write_all(v.as_bytes())?;
                     } else {
-                        stream.write_all(&[protocol::GET_NIL])?;
+                        writer.write_all(&[protocol::GET_NIL])?;
                     }
+                    writer.write_all(&['\n' as u8])?;
                 }
             }
             _ => {
-                stream.write_all("ErrOp".as_bytes())?;
+                writer.write_all("ErrOp\n".as_bytes())?;
             }
         }
+        break; // todo
     }
+    Ok(())
 }
