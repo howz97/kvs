@@ -1,6 +1,6 @@
 use clap::{Arg, Command};
 use kvs::protocol;
-use kvs::Result;
+use kvs::{MyErr, Result};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::TcpStream;
 use std::process::exit;
@@ -23,16 +23,26 @@ fn main() -> Result<()> {
                 .args(&[
                     Arg::new(ARG_KEY),
                     Arg::new(ARG_VAL),
-                    Arg::new("addr").default_value("127.0.0.1:4000"),
+                    Arg::new("addr")
+                        .long("addr")
+                        .default_value("127.0.0.1:4000"),
                 ]),
             Command::new(CMD_GET)
                 .about("Get value by key")
                 .arg(Arg::new(ARG_KEY))
-                .arg(Arg::new("addr").default_value("127.0.0.1:4000")),
+                .arg(
+                    Arg::new("addr")
+                        .long("addr")
+                        .default_value("127.0.0.1:4000"),
+                ),
             Command::new(CMD_RM)
                 .about("Remove value by key")
                 .arg(Arg::new(ARG_KEY))
-                .arg(Arg::new("addr").default_value("127.0.0.1:4000")),
+                .arg(
+                    Arg::new("addr")
+                        .long("addr")
+                        .default_value("127.0.0.1:4000"),
+                ),
         ])
         .after_help("--Over--")
         .get_matches();
@@ -88,7 +98,7 @@ impl Client {
         self.writer.flush()?;
         let mut ret = String::new();
         self.reader.read_line(&mut ret)?;
-        println!("{}", ret);
+        // println!("{}", ret);
         Ok(())
     }
     fn remove(&mut self, key: String) -> Result<()> {
@@ -98,7 +108,10 @@ impl Client {
         self.writer.flush()?;
         let mut ret = String::new();
         self.reader.read_line(&mut ret)?;
-        println!("{}", ret);
+        if ret.contains("Key not found") {
+            eprintln!("Key not found");
+            Err(MyErr::KeyNotFound)?
+        }
         Ok(())
     }
     fn get(&mut self, key: String) -> Result<()> {
@@ -112,10 +125,10 @@ impl Client {
             protocol::GET_VAL => {
                 let mut val = String::new();
                 self.reader.read_line(&mut val)?;
-                println!("Val={}", val);
+                print!("{}", val);
             }
             protocol::GET_NIL => {
-                println!("Nil");
+                print!("Key not found");
             }
             protocol::GET_ERR => {
                 let mut err = String::new();

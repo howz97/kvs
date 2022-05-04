@@ -53,13 +53,24 @@ impl KvStore {
         let mut older = BTreeMap::new();
         let mut file_id: u32 = 0;
         for e in dir.iter() {
-            file_id = e
-                .file_stem()
-                .expect("invalid file")
-                .to_str()
-                .unwrap()
-                .parse()?;
-            let mut file = File::open(e)?;
+            let mut file;
+            if e.ends_with("active.kvs") {
+                file_id += 1;
+                let mut from = dir_path.clone();
+                from.push("active.kvs");
+                let mut to = dir_path.clone();
+                to.push(format!("{}.kvs", file_id));
+                rename(from, to.clone())?;
+                file = File::open(to)?;
+            } else {
+                file_id = e
+                    .file_stem()
+                    .expect("invalid file")
+                    .to_str()
+                    .unwrap()
+                    .parse()?;
+                file = File::open(e)?;
+            }
             let handle_log = |offset, cmd: Entry| {
                 if !cmd.is_del {
                     table.insert(cmd.key, Index::new(file_id, offset));

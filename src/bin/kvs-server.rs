@@ -9,7 +9,7 @@ use std::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info};
 use tracing_subscriber;
 
-const DEFAULT_DIR: &str = ".\\testdata";
+const DEFAULT_DIR: &str = ".";
 static X: &[char] = &['\n', '\t', ' '];
 
 fn main() -> Result<()> {
@@ -18,8 +18,16 @@ fn main() -> Result<()> {
         .author(env!("CARGO_PKG_AUTHORS"))
         .version(env!("CARGO_PKG_VERSION"))
         .about(env!("CARGO_PKG_DESCRIPTION"))
-        .arg(Arg::new("addr").default_value("127.0.0.1:4000"))
-        .arg(Arg::new("engine").possible_values(["kvs", "sled"]))
+        .arg(
+            Arg::new("addr")
+                .long("addr")
+                .default_value("127.0.0.1:4000"),
+        )
+        .arg(
+            Arg::new("engine")
+                .long("engine")
+                .possible_values(["kvs", "sled"]),
+        )
         .after_help("--Over--")
         .get_matches();
     let addr = m.value_of("addr").unwrap();
@@ -98,8 +106,9 @@ fn handle_client(stream: TcpStream, store: &mut Box<dyn KvsEngine>) -> Result<()
                     writer.write_all("ErrNoKey\n".as_bytes())?;
                     break;
                 }
-                if let Err(_) = store.remove(key) {
-                    writer.write_all("ErrInternal\n".as_bytes())?;
+                if let Err(e) = store.remove(key) {
+                    writer.write_all(e.to_string().as_bytes())?;
+                    writer.write_all(&['\n' as u8])?;
                 } else {
                     writer.write_all("OK\n".as_bytes())?;
                 }
