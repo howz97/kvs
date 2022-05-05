@@ -22,6 +22,7 @@ pub enum MyErr {
     KeyNotFound,
     InvalidArg,
     ErrExtension,
+    WrongEngine,
 }
 
 impl fmt::Display for MyErr {
@@ -30,6 +31,7 @@ impl fmt::Display for MyErr {
             MyErr::KeyNotFound => write!(f, "Key not found"),
             MyErr::InvalidArg => write!(f, "Invalid argument"),
             MyErr::ErrExtension => write!(f, "Unexpected file extension"),
+            MyErr::WrongEngine => write!(f, "Wrong engine detected"),
         }
     }
 }

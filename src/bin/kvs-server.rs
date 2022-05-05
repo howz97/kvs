@@ -32,30 +32,30 @@ fn main() -> Result<()> {
         .get_matches();
     let addr = m.value_of("addr").unwrap();
     let engine = m.value_of("engine");
-    info!(addr, engine, "kvs-server start...");
+    eprintln!(
+        "kvs-server[v{}] start...addr={}, engine={:?}",
+        env!("CARGO_PKG_VERSION"),
+        addr,
+        engine
+    );
 
     let mut store: Box<dyn KvsEngine>;
     let mut eng = "kvs".to_owned();
     if let Some(e) = m.value_of("engine") {
         eng = e.to_owned();
-    } else {
-        for entry in read_dir(DEFAULT_DIR)? {
-            eng = entry?
-                .path()
-                .extension()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_owned();
-            break;
+        if let Some(last) = last_engine()? {
+            if eng != last {
+                Err(MyErr::WrongEngine)?
+            }
         }
+    } else if let Some(last) = last_engine()? {
+        eng = last;
     }
     if eng == "kvs" {
         store = Box::new(my_engine::KvStore::open(DEFAULT_DIR)?);
     } else if eng == "sled" {
         store = Box::new(SledKvEngine::open(DEFAULT_DIR)?);
     } else {
-        Err(MyErr::ErrExtension)?;
         panic!("never execute")
     }
     let listener = TcpListener::bind(addr)?;
@@ -68,6 +68,18 @@ fn main() -> Result<()> {
     }
     info!("kvs-server shutdown!");
     Ok(())
+}
+
+fn last_engine() -> Result<Option<String>> {
+    for entry in read_dir(DEFAULT_DIR)? {
+        if let Some(ext) = entry?.path().extension() {
+            if ext == "kvs" {
+                return Ok(Some("kvs".to_owned()));
+            }
+        }
+        return Ok(Some("sled".to_owned()));
+    }
+    Ok(None)
 }
 
 fn handle_client(stream: TcpStream, store: &mut Box<dyn KvsEngine>) -> Result<()> {
@@ -106,7 +118,7 @@ fn handle_client(stream: TcpStream, store: &mut Box<dyn KvsEngine>) -> Result<()
                     writer.write_all("ErrNoKey\n".as_bytes())?;
                     break;
                 }
-                debug!(key, "Removing");
+                debug!("Removing {}", key);
                 if let Err(e) = store.remove(key) {
                     writer.write_all(e.to_string().as_bytes())?;
                     writer.write_all(&['\n' as u8])?;

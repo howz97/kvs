@@ -18,6 +18,7 @@ impl SledKvEngine {
 impl KvsEngine for SledKvEngine {
     fn set(&mut self, key: String, val: String) -> Result<()> {
         self.db.insert(key, val.as_bytes())?;
+        self.db.flush()?;
         Ok(())
     }
     fn get(&mut self, key: String) -> Result<Option<String>> {
@@ -30,6 +31,7 @@ impl KvsEngine for SledKvEngine {
     }
     fn remove(&mut self, key: String) -> Result<()> {
         self.db.remove(key)?.ok_or(MyErr::KeyNotFound)?;
+        self.db.flush()?;
         Ok(())
     }
 }
