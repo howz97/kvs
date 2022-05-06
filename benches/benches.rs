@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use kvs::my_engine::KvStore;
 use kvs::sled_engine::SledKvEngine;
 use kvs::KvsEngine;
@@ -24,6 +24,12 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             .collect();
         data.push((key, val));
     }
+    let mut read_seq = Vec::new();
+    for _ in 0..1000 {
+        let i = rng.gen_range(0, 100);
+        let (k, v) = data.get(i).unwrap();
+        read_seq.push((k.clone(), v.clone()));
+    }
 
     let kvs_dir = TempDir::new().unwrap();
     let mut kvs_store = KvStore::open(&kvs_dir.path()).unwrap();
@@ -36,10 +42,8 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     });
     c.bench_function("kvs read", |b| {
         b.iter(|| {
-            for _ in 0..10 {
-                for (k, _) in &data {
-                    kvs_store.get(k.clone()).unwrap();
-                }
+            for (k, v) in &read_seq {
+                assert_eq!(kvs_store.get(k.clone()).unwrap().unwrap(), *v);
             }
         })
     });
@@ -55,10 +59,8 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     });
     c.bench_function("sled read", |b| {
         b.iter(|| {
-            for _ in 0..10 {
-                for (k, _) in &data {
-                    sled_store.get(k.clone()).unwrap();
-                }
+            for (k, v) in &read_seq {
+                assert_eq!(sled_store.get(k.clone()).unwrap().unwrap(), *v);
             }
         })
     });

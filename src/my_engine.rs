@@ -8,9 +8,10 @@ use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::result;
+use tracing::{debug, info};
 
-const SEGMENT_SIZE: u64 = 1 << 20;
-const COMPACT_THRESHOLD: usize = 10;
+const SEGMENT_SIZE: u64 = 10 << 20;
+const COMPACT_THRESHOLD: usize = 100;
 
 /// KvStore is the core data structure keeping all KV pairs
 pub struct KvStore {
@@ -24,11 +25,11 @@ pub struct KvStore {
 #[derive(Debug)]
 pub struct Index {
     file: u32, // file_id
-    offset: u32,
+    offset: u64,
 }
 
 impl Index {
-    fn new(file: u32, offset: u32) -> Self {
+    fn new(file: u32, offset: u64) -> Self {
         Index { file, offset }
     }
 }
@@ -113,48 +114,59 @@ impl KvStore {
 
     fn maybe_compaction(&mut self) {
         if self.older_files.len() >= COMPACT_THRESHOLD {
+            info!("start compaction");
             // todo: trigger by size of file contents
             let mut path = self.dir_path.clone();
             path.push("compacting.kvs");
             let mut compacted = File::options()
                 .append(true)
                 .create_new(true)
-                .open(path.clone())
+                .open(&path)
                 .expect("failed to create compacting file");
             // todo: choose files to compact
-            while let Some((id, file)) = self.older_files.iter_mut().take(4).next() {
+            let mut choosed = self.older_files.iter_mut().take(4);
+            while let Some((id, file)) = choosed.next() {
                 let compact_log = |offset, ent: Entry| {
-                    let mut keep = false;
-                    let opt_idx = self.table.get(&ent.key);
+                    let opt_idx = self.table.get_mut(&ent.key);
                     if ent.is_del {
                         if opt_idx.is_none() {
                             // maybe a put Entry exists in previous log
-                            keep = true;
+                            append_entry(&mut compacted, ent).expect("failed to write");
                         }
                     } else {
                         if let Some(idx) = opt_idx {
                             if idx.file == *id && idx.offset == offset {
-                                keep = true;
+                                idx.file = 1;
+                                idx.offset = compacted.stream_position().unwrap();
+                                append_entry(&mut compacted, ent).expect("failed to write");
                             }
                         }
                     }
-                    if keep {
-                        append_entry(&mut compacted, ent).expect("failed to write");
-                    }
                 };
+                debug!("start to compact file {}.kvs", id);
                 iter_entries(file, compact_log);
             }
+            // remove old files
+            let mut removing = self.older_files.keys().take(4);
             let mut keys = Vec::new();
-            while let Some(&id) = self.older_files.keys().take(4).next() {
+            while let Some(&id) = removing.next() {
                 keys.push(id);
             }
             for id in keys {
                 self.older_files.remove(&id);
-                remove_file(format!("{}.kvs", id)).unwrap();
+                let mut rm_path = self.dir_path.clone();
+                rm_path.push(format!("{}.kvs", id));
+                remove_file(rm_path).unwrap();
+                debug!("file {}.kvs removed", id);
             }
+            // adopt compacted file
+            drop(compacted); // reopen in Read-Only later
             let mut to_path = self.dir_path.clone();
             to_path.push("1.kvs");
-            rename(path, to_path).expect("compaction failed");
+            rename(path, &to_path).expect("compaction failed");
+            let compacted = File::open(to_path).unwrap();
+            self.older_files.insert(1, compacted);
+            info!("finish compaction");
         }
     }
 
@@ -183,7 +195,7 @@ impl KvsEngine for KvStore {
     /// # }
     /// ```
     fn set(&mut self, key: String, val: String) -> Result<()> {
-        let offset = self.active_file.stream_position()? as u32;
+        let offset = self.active_file.stream_position()?;
         append_entry(&mut self.active_file, Entry::put(key.clone(), val))?;
         self.table.insert(key, Index::new(self.active_id, offset));
         self.maybe_cut();
@@ -213,7 +225,7 @@ impl KvsEngine for KvStore {
             } else {
                 file = self.older_files.get_mut(&idx.file).unwrap();
             }
-            file.seek(SeekFrom::Start(idx.offset as u64))?;
+            file.seek(SeekFrom::Start(idx.offset))?;
             let ent = read_entry(&mut file)?;
             Ok(Some(ent.val))
         } else {
@@ -260,13 +272,13 @@ impl Drop for KvStore {
     }
 }
 
-fn iter_entries<F: FnMut(u32, Entry)>(file: &mut File, mut f: F) {
-    let file_len = file.metadata().unwrap().len() as u32;
-    let mut offset: u32 = 0;
+fn iter_entries<F: FnMut(u64, Entry)>(file: &mut File, mut f: F) {
+    let file_len = file.metadata().unwrap().len();
+    let mut offset: u64 = file.seek(SeekFrom::Start(0)).unwrap();
     while offset < file_len {
-        let ent = read_entry(file).unwrap();
+        let ent = read_entry(file).expect("failed to read entry");
         f(offset, ent);
-        offset = file.stream_position().unwrap() as u32;
+        offset = file.stream_position().unwrap();
     }
 }
 
