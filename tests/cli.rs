@@ -184,14 +184,12 @@ fn cli_wrong_engine() {
             .unwrap();
         thread::sleep(Duration::from_secs(1));
         child.kill().expect("server exited before killed");
-
         let mut cmd = Command::cargo_bin("kvs-server").unwrap();
         cmd.args(&["--engine", "kvs", "--addr", "127.0.0.1:4003"])
             .current_dir(&temp_dir)
             .assert()
             .failure();
     }
-
     // kvs first, sled second
     {
         let temp_dir = TempDir::new().unwrap();
@@ -334,44 +332,4 @@ fn cli_access_server_kvs_engine() {
 #[test]
 fn cli_access_server_sled_engine() {
     cli_access_server("sled", "127.0.0.1:4005");
-}
-
-use kvs::my_engine::KvStore;
-use kvs::KvsEngine;
-use rand::distributions::Alphanumeric;
-use rand::{thread_rng, Rng};
-use tracing_subscriber;
-#[test]
-fn my_bench() {
-    tracing_subscriber::fmt::init();
-    let mut rng = thread_rng();
-    let mut data = Vec::new();
-    for _ in 0..100 {
-        let key_len: usize = rng.gen_range(1, 100000);
-        let key: String = rng
-            .sample_iter(&Alphanumeric)
-            .take(key_len)
-            .map(char::from)
-            .collect();
-        let val_len: usize = rng.gen_range(1, 100000);
-        let val: String = rng
-            .sample_iter(&Alphanumeric)
-            .take(val_len)
-            .map(char::from)
-            .collect();
-        data.push((key, val));
-    }
-
-    let kvs_dir = TempDir::new().unwrap();
-    let mut kvs_store = KvStore::open(&kvs_dir.path()).unwrap();
-
-    for (k, v) in &data {
-        kvs_store.set(k.clone(), v.clone()).unwrap();
-    }
-
-    for _ in 0..10 {
-        for (k, v) in &data {
-            assert_eq!(kvs_store.get(k.clone()).unwrap().unwrap(), *v);
-        }
-    }
 }

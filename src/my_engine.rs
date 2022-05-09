@@ -3,18 +3,19 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::{BTreeMap, HashMap};
 
+use std::clone::Clone;
 use std::fs::{read_dir, remove_file, rename, File};
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::result;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
 
 const SEGMENT_SIZE: u64 = 10 << 20;
 const COMPACT_THRESHOLD: usize = 100;
 
-/// KvStore is the core data structure keeping all KV pairs
-pub struct KvStore {
+struct InnerStore {
     table: HashMap<String, Index>,
     older_files: BTreeMap<u32, File>,
     active_file: File,
@@ -22,7 +23,7 @@ pub struct KvStore {
     dir_path: PathBuf,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Index {
     file: u32, // file_id
     offset: u64,
@@ -34,21 +35,24 @@ impl Index {
     }
 }
 
-impl KvStore {
-    pub fn open(path: impl Into<PathBuf>) -> Result<KvStore> {
+impl InnerStore {
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let dir_path = path.into();
-        let mut dir = read_dir(dir_path.clone())?
+        debug!("opening path {:?}", dir_path);
+        let mut dir = read_dir(&dir_path)?
             .map(|res| res.map(|e| e.path()))
             .filter(|res| {
                 if let Ok(p) = res {
-                    if p.extension().unwrap() == "kvs" {
-                        return true;
+                    if let Some(ext) = p.extension() {
+                        if ext == "kvs" {
+                            return true;
+                        }
                     }
                 }
                 false
             })
             .collect::<result::Result<Vec<_>, io::Error>>()?;
-
+        debug!("total {} kvs files found", dir.len());
         dir.sort();
         let mut table = HashMap::new();
         let mut older = BTreeMap::new();
@@ -82,8 +86,8 @@ impl KvStore {
             iter_entries(&mut file, handle_log);
             older.insert(file_id, file);
         }
-
-        let store = KvStore {
+        debug!("succeed to open dir");
+        let store = InnerStore {
             table: table,
             older_files: older,
             active_file: new_active_file(dir_path.clone())?,
@@ -180,13 +184,28 @@ impl KvStore {
     }
 }
 
+#[derive(Clone)]
+pub struct KvStore {
+    db: Arc<Mutex<InnerStore>>,
+}
+
+impl KvStore {
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
+        let inner = InnerStore::open(path)?;
+        Ok(KvStore {
+            db: Arc::new(Mutex::new(inner)),
+        })
+    }
+}
+
 impl KvsEngine for KvStore {
     /// Insert/Update key-value
     ///
     /// # Example
     ///
     /// ```rust
-    /// # use kvs::{KvStore, Result};
+    /// # use kvs::{Result, KvsEngine};
+    /// # use kvs::my_engine::KvStore;
     /// # use tempfile::TempDir;
     /// # fn main() -> Result<()> {
     /// #   let temp_dir = TempDir::new().expect("unable to create temporary working directory");
@@ -194,11 +213,13 @@ impl KvsEngine for KvStore {
     /// #   store.set("a".to_string(), "A".to_string())
     /// # }
     /// ```
-    fn set(&mut self, key: String, val: String) -> Result<()> {
-        let offset = self.active_file.stream_position()?;
-        append_entry(&mut self.active_file, Entry::put(key.clone(), val))?;
-        self.table.insert(key, Index::new(self.active_id, offset));
-        self.maybe_cut();
+    fn set(&self, key: String, val: String) -> Result<()> {
+        let mut store = self.db.lock().unwrap();
+        let offset = store.active_file.stream_position()?;
+        append_entry(&mut store.active_file, Entry::put(key.clone(), val))?;
+        let idx = Index::new(store.active_id, offset);
+        store.table.insert(key, idx);
+        store.maybe_cut();
         Ok(())
     }
     /// Get value by key
@@ -206,7 +227,8 @@ impl KvsEngine for KvStore {
     /// # Example
     ///
     /// ```rust
-    /// # use kvs::{KvStore, Result};
+    /// # use kvs::{Result, KvsEngine};
+    /// # use kvs::my_engine::KvStore;
     /// # use tempfile::TempDir;
     /// # fn main() -> Result<()> {
     /// #   let temp_dir = TempDir::new().expect("unable to create temporary working directory");
@@ -217,13 +239,15 @@ impl KvsEngine for KvStore {
     /// #   Ok(())
     /// # }
     /// ```
-    fn get(&mut self, key: String) -> Result<Option<String>> {
-        if let Some(idx) = self.table.get(&key) {
+    fn get(&self, key: String) -> Result<Option<String>> {
+        let mut store = self.db.lock().unwrap();
+        if let Some(idx) = store.table.get(&key) {
+            let idx = idx.clone();
             let mut file;
-            if idx.file == self.active_id {
-                file = &mut self.active_file
+            if idx.file == store.active_id {
+                file = &mut store.active_file
             } else {
-                file = self.older_files.get_mut(&idx.file).unwrap();
+                file = store.older_files.get_mut(&idx.file).unwrap();
             }
             file.seek(SeekFrom::Start(idx.offset))?;
             let ent = read_entry(&mut file)?;
@@ -238,7 +262,8 @@ impl KvsEngine for KvStore {
     /// # Example
     ///
     /// ```rust
-    /// # use kvs::{KvStore, Result};
+    /// # use kvs::{Result, KvsEngine};
+    /// # use kvs::my_engine::KvStore;
     /// # use tempfile::TempDir;
     /// # fn main() -> Result<()> {
     /// #   let temp_dir = TempDir::new().expect("unable to create temporary working directory");
@@ -247,10 +272,11 @@ impl KvsEngine for KvStore {
     /// #   store.remove("a".to_string())
     /// # }
     /// ```
-    fn remove(&mut self, key: String) -> Result<()> {
-        self.table.remove(&key).ok_or(MyErr::KeyNotFound)?;
-        append_entry(&mut self.active_file, Entry::del(key.clone()))?;
-        self.maybe_cut();
+    fn remove(&self, key: String) -> Result<()> {
+        let mut store = self.db.lock().unwrap();
+        store.table.remove(&key).ok_or(MyErr::KeyNotFound)?;
+        append_entry(&mut store.active_file, Entry::del(key.clone()))?;
+        store.maybe_cut();
         Ok(())
     }
 }
@@ -265,7 +291,7 @@ fn new_active_file(mut path: PathBuf) -> Result<File> {
     Ok(file)
 }
 
-impl Drop for KvStore {
+impl Drop for InnerStore {
     fn drop(&mut self) {
         self.rename_active()
             .expect("failed to rename active file when drop KvStore");

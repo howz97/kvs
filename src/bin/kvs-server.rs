@@ -2,7 +2,9 @@ use clap::{Arg, Command};
 use kvs::my_engine;
 use kvs::protocol;
 use kvs::sled_engine::SledKvEngine;
+use kvs::thread_pool::{SharedQueueThreadPool, ThreadPool};
 use kvs::{KvsEngine, MyErr, Result};
+use num_cpus;
 use std::fs::read_dir;
 use std::io::{self, BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -28,43 +30,56 @@ fn main() -> Result<()> {
                 .long("engine")
                 .possible_values(["kvs", "sled"]),
         )
+        .arg(
+            Arg::new("pool")
+                .long("thread-pool")
+                .possible_values(["naive", "better"])
+                .default_value("better"),
+        )
         .after_help("--Over--")
         .get_matches();
     let addr = m.value_of("addr").unwrap();
-    let engine = m.value_of("engine");
-    eprintln!(
-        "kvs-server[v{}] start...addr={}, engine={:?}",
-        env!("CARGO_PKG_VERSION"),
-        addr,
-        engine
-    );
-
-    let mut store: Box<dyn KvsEngine>;
     let mut eng = "kvs".to_owned();
     if let Some(e) = m.value_of("engine") {
         eng = e.to_owned();
         if let Some(last) = last_engine()? {
             if eng != last {
+                error!("failed to start, because wrong engine is specified");
                 Err(MyErr::WrongEngine)?
             }
         }
     } else if let Some(last) = last_engine()? {
         eng = last;
     }
+    let pool = SharedQueueThreadPool::new(num_cpus::get() as u32)?;
+    eprintln!(
+        "kvs-server[v{}] starting...addr={}, engine={}",
+        env!("CARGO_PKG_VERSION"),
+        addr,
+        eng
+    );
     if eng == "kvs" {
-        store = Box::new(my_engine::KvStore::open(DEFAULT_DIR)?);
+        run(addr, my_engine::KvStore::open(DEFAULT_DIR)?, pool)
     } else if eng == "sled" {
-        store = Box::new(SledKvEngine::open(DEFAULT_DIR)?);
+        run(addr, SledKvEngine::open(DEFAULT_DIR)?, pool)
     } else {
         panic!("never execute")
     }
+}
+
+fn run<E: KvsEngine, P: ThreadPool>(addr: &str, engine: E, pool: P) -> Result<()> {
+    info!("kvs-server is running...");
     let listener = TcpListener::bind(addr)?;
     // accept connections and process them serially
     for stream in listener.incoming() {
-        debug!("connected");
-        if let Err(_) = handle_client(stream?, &mut store) {
-            error!("TCP is disconnected")
-        }
+        let stream = stream?;
+        let eng = engine.clone();
+        debug!("start serving client");
+        pool.spawn(move || {
+            if let Err(e) = handle_client(stream, eng) {
+                error!("error on serving client: {}", e)
+            }
+        });
     }
     info!("kvs-server shutdown!");
     Ok(())
@@ -72,17 +87,23 @@ fn main() -> Result<()> {
 
 fn last_engine() -> Result<Option<String>> {
     for entry in read_dir(DEFAULT_DIR)? {
-        if let Some(ext) = entry?.path().extension() {
+        let entry = entry?;
+        if let Some(ext) = entry.path().extension() {
             if ext == "kvs" {
+                debug!("last_engine: kvs");
                 return Ok(Some("kvs".to_owned()));
             }
+        } else if entry.path().ends_with("db") {
+            debug!("last_engine: sled");
+            return Ok(Some("sled".to_owned()));
         }
-        return Ok(Some("sled".to_owned()));
+        debug!("last_engine: file found {:?}", entry.path());
     }
+    debug!("last_engine: none");
     Ok(None)
 }
 
-fn handle_client(stream: TcpStream, store: &mut Box<dyn KvsEngine>) -> Result<()> {
+fn handle_client<E: KvsEngine>(stream: TcpStream, eng: E) -> Result<()> {
     let mut reader = io::BufReader::new(stream.try_clone().unwrap());
     let mut writer = io::BufWriter::new(stream);
     let mut op = [0; 1];
@@ -104,7 +125,7 @@ fn handle_client(stream: TcpStream, store: &mut Box<dyn KvsEngine>) -> Result<()
                     writer.write_all("ErrNoVal\n".as_bytes())?;
                     break;
                 }
-                if let Err(_) = store.set(key, val) {
+                if let Err(_) = eng.set(key, val) {
                     writer.write_all("ErrInternal\n".as_bytes())?;
                 } else {
                     writer.write_all("OK\n".as_bytes())?;
@@ -119,7 +140,7 @@ fn handle_client(stream: TcpStream, store: &mut Box<dyn KvsEngine>) -> Result<()
                     break;
                 }
                 debug!("Removing {}", key);
-                if let Err(e) = store.remove(key) {
+                if let Err(e) = eng.remove(key) {
                     writer.write_all(e.to_string().as_bytes())?;
                     writer.write_all(&['\n' as u8])?;
                 } else {
@@ -135,7 +156,7 @@ fn handle_client(stream: TcpStream, store: &mut Box<dyn KvsEngine>) -> Result<()
                     writer.write_all("ErrNoKey\n".as_bytes())?;
                     break;
                 }
-                let res = store.get(key);
+                let res = eng.get(key);
                 if let Err(_) = res {
                     writer.write_all(&[protocol::GET_ERR])?;
                     writer.write_all("ErrInternal\n".as_bytes())?;

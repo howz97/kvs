@@ -4,7 +4,7 @@ use kvs::Result;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::TcpStream;
 use std::process::exit;
-use tracing::{debug, error};
+use tracing::debug;
 
 const ARG_KEY: &str = "key";
 const ARG_VAL: &str = "value";
