@@ -4,7 +4,7 @@ use rayon;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 pub trait ThreadPool {
     fn new(threads: u32) -> Result<Self>
@@ -42,7 +42,7 @@ pub struct SharedQueueThreadPool {
 impl ThreadPool for SharedQueueThreadPool {
     fn new(threads: u32) -> Result<Self> {
         debug!("creating thread pool, size={}", threads);
-        let (sdr, rcv) = channel::bounded(4096);
+        let (sdr, rcv) = channel::unbounded();
         let rcv = Arc::new(Mutex::new(rcv));
         let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
         for id in 0..threads {
@@ -93,6 +93,7 @@ impl Drop for SharedQueueThreadPool {
         }
         for handle in self.handles.drain(..) {
             handle.join().expect("failed to terminate thread");
+            info!("SharedQueueThreadPool closed one thread");
         }
     }
 }

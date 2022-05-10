@@ -1,7 +1,9 @@
 // #![deny(missing_docs)]
 //! This is key-value store lib
+pub mod client;
 pub mod my_engine;
 pub mod protocol;
+pub mod server;
 pub mod sled_engine;
 pub mod thread_pool;
 
