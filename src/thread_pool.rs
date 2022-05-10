@@ -42,7 +42,7 @@ pub struct SharedQueueThreadPool {
 impl ThreadPool for SharedQueueThreadPool {
     fn new(threads: u32) -> Result<Self> {
         debug!("creating thread pool, size={}", threads);
-        let (sdr, rcv) = channel::unbounded();
+        let (sdr, rcv) = channel::bounded(0);
         let rcv = Arc::new(Mutex::new(rcv));
         let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
         for id in 0..threads {
@@ -55,11 +55,11 @@ impl ThreadPool for SharedQueueThreadPool {
                 }
                 match res.unwrap() {
                     ThreadPoolMessage::RunJob(f) => {
-                        debug!("thread {} received job", id);
+                        info!("thread {} received job", id);
                         if let Err(e) = catch_unwind(AssertUnwindSafe(f)) {
                             error!("panic occur on thread {}: {:?}", id, e);
                         };
-                        debug!("thread {} finished job", id);
+                        info!("thread {} finished job", id);
                     }
                     ThreadPoolMessage::Shutdown => {
                         debug!("thread {} received shutdown", id);
