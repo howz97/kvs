@@ -20,6 +20,7 @@ sled = "0.34"
 crossbeam = "0.8"
 num_cpus = "1.13"
 rayon = "1.5"
+dashmap = "5.3"
 
 [dev-dependencies]
 assert_cmd = "0.11"

@@ -4,7 +4,7 @@ use rayon;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, trace};
 
 pub trait ThreadPool {
     fn new(threads: u32) -> Result<Self>
@@ -55,11 +55,11 @@ impl ThreadPool for SharedQueueThreadPool {
                 }
                 match res.unwrap() {
                     ThreadPoolMessage::RunJob(f) => {
-                        info!("thread {} received job", id);
+                        trace!("SharedQueueThreadPool: thread {} received job", id);
                         if let Err(e) = catch_unwind(AssertUnwindSafe(f)) {
                             error!("panic occur on thread {}: {:?}", id, e);
                         };
-                        info!("thread {} finished job", id);
+                        trace!("SharedQueueThreadPool: thread {} finished job", id);
                     }
                     ThreadPoolMessage::Shutdown => {
                         debug!("thread {} received shutdown", id);
@@ -93,7 +93,7 @@ impl Drop for SharedQueueThreadPool {
         }
         for handle in self.handles.drain(..) {
             handle.join().expect("failed to terminate thread");
-            info!("SharedQueueThreadPool closed one thread");
+            trace!("SharedQueueThreadPool closed one thread");
         }
     }
 }

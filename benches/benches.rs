@@ -11,14 +11,17 @@ use rand::{thread_rng, Rng};
 use std::net::TcpStream;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
+use std::time::Duration;
 use tempfile::TempDir;
-use tracing::info;
+use tracing::{debug, error, info, trace};
 use tracing_subscriber;
 
 pub fn thread_pool_bench(c: &mut Criterion) {
-    const NUM_CLIENT: usize = 5;
+    const NUM_CLIENT: usize = 1000;
+    const SERVER_ADDR: &str = "127.0.0.1:6000";
+
     tracing_subscriber::fmt().init();
-    let inputs = &[1, 2, 4, 6, 8, 10, 12, 14, 16];
+    let inputs = &[2, 4, 8, 16];
     let mut rng = thread_rng();
     let mut data: Vec<String> = Vec::new();
     for _ in 0..NUM_CLIENT {
@@ -32,18 +35,18 @@ pub fn thread_pool_bench(c: &mut Criterion) {
     c.bench_function_over_inputs(
         "write-heavey",
         move |b, &&num| {
-            info!("bench for {} thread pool", num);
+            debug!("bench for {} thread pool", num);
             // start server
             let (shut_sdr, shut_rcv) = channel::bounded(1);
             let dir = TempDir::new().unwrap();
             let server_handle = thread::spawn(move || {
                 server::run(
-                    "127.0.0.1:4000",
+                    SERVER_ADDR,
                     KvStore::open(dir.path()).unwrap(),
                     SharedQueueThreadPool::new(num).unwrap(),
                     shut_rcv,
                 )
-                .unwrap();
+                .expect("failed to start server");
             });
 
             // prepare client thread
@@ -51,55 +54,75 @@ pub fn thread_pool_bench(c: &mut Criterion) {
             let (clients_ctl, cmd_input) = channel::bounded(0);
             let cmd_input = Arc::new(Mutex::new(cmd_input));
             let barrier_end = Arc::new(Barrier::new(NUM_CLIENT + 1));
-            for k in &data {
+            for (i, k) in data.iter().enumerate() {
                 let k = k.to_owned();
                 let ba_end = barrier_end.clone();
                 let cmd_input = cmd_input.clone();
                 let h = thread::spawn(move || loop {
-                    let mut cli = Client::new(TcpStream::connect("127.0.0.1:4000").unwrap());
                     let cmd = cmd_input.lock().unwrap().recv().unwrap();
+                    trace!("client {} received command {}", i, cmd);
                     if cmd == 1 {
-                        cli.set(k.to_owned(), "zh".to_owned())
-                            .expect("failed to set");
+                        // fixme: this connect maybe fail (AddrInUse)
+                        let stream = TcpStream::connect(SERVER_ADDR);
+                        match stream {
+                            Err(e) => error!("client failed to connect server {}", e),
+                            Ok(stream) => {
+                                let mut cli = Client::new(stream);
+                                if let Err(e) = cli.set(k.to_owned(), "zh".to_owned()) {
+                                    error!("failed to set {}", e);
+                                }
+                            }
+                        }
                     } else {
                         break;
                     }
-                    ba_end.wait();
+                    if ba_end.wait().is_leader() {
+                        debug!("barrier passed");
+                    }
                 });
                 handles.push(h);
             }
-            info!("{} clients is ready", handles.len());
+            thread::sleep(Duration::from_secs(1));
+            debug!("{} clients is ready", handles.len());
 
             // all ready
             b.iter(|| {
-                info!("enter iter content");
+                debug!("enter iter content");
                 for _ in 0..NUM_CLIENT {
                     clients_ctl.send(1).unwrap();
                 }
-                info!("running !!!");
                 // wait until all clients finished
                 barrier_end.wait();
-                info!("all clients finished")
+                debug!("all clients finished")
             });
 
             // shutdown server
             shut_sdr.send(()).unwrap();
-            Client::new(TcpStream::connect("127.0.0.1:4000").unwrap())
-                .get("ping".to_owned())
-                .unwrap_err();
-            info!("waiting for server to exited");
-            server_handle.join().unwrap();
-            info!("server exited already. terminate clients now");
+            loop {
+                let stream = TcpStream::connect(SERVER_ADDR);
+                if let Err(e) = stream {
+                    error!("failed to connnect to server, try again: {}", e);
+                    thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+                Client::new(stream.unwrap())
+                    .get("ping".to_owned())
+                    .unwrap_err();
+                debug!("waiting for server to exited");
+                server_handle.join().unwrap();
+                break;
+            }
+            debug!("server exited already. terminate clients now");
 
             // terminate clients thread
             for _ in 0..NUM_CLIENT {
                 clients_ctl.send(2).unwrap();
             }
-            info!("terminateing clients thread");
+            debug!("terminateing clients thread");
             for handle in handles.drain(..) {
                 handle.join().unwrap();
             }
-            info!("all clients exited");
+            debug!("all clients exited");
         },
         inputs,
     );
@@ -183,5 +206,10 @@ fn engine_sled_bench(
     });
 }
 
-criterion_group!(benches, thread_pool_bench);
+criterion_group! {
+    name = benches;
+    // This can be any expression that returns a `Criterion` object.
+    config = Criterion::default().significance_level(0.1).sample_size(3);
+    targets = thread_pool_bench
+}
 criterion_main!(benches);
