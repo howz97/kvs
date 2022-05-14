@@ -3,6 +3,7 @@ use kvs::{KvsEngine, Result};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use tempfile::TempDir;
+use tracing_subscriber;
 use walkdir::WalkDir;
 
 // Should get previously stored value
@@ -130,6 +131,7 @@ fn compaction() -> Result<()> {
 
 #[test]
 fn concurrent_set() -> Result<()> {
+    tracing_subscriber::fmt().init();
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
     let store = KvStore::open(temp_dir.path())?;
     let barrier = Arc::new(Barrier::new(1001));

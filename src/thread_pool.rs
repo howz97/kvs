@@ -4,7 +4,7 @@ use rayon;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, trace};
 
 pub trait ThreadPool {
     fn new(threads: u32) -> Result<Self>

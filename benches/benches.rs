@@ -17,11 +17,11 @@ use tracing::{debug, error, info, trace};
 use tracing_subscriber;
 
 pub fn thread_pool_bench(c: &mut Criterion) {
-    const NUM_CLIENT: usize = 1000;
-    const SERVER_ADDR: &str = "127.0.0.1:6000";
+    const NUM_CLIENT: usize = 500;
+    const SERVER_ADDR: &str = "127.0.0.1:4000";
 
     tracing_subscriber::fmt().init();
-    let inputs = &[2, 4, 8, 16];
+    let inputs = &[8, 16];
     let mut rng = thread_rng();
     let mut data: Vec<String> = Vec::new();
     for _ in 0..NUM_CLIENT {
@@ -209,7 +209,7 @@ fn engine_sled_bench(
 criterion_group! {
     name = benches;
     // This can be any expression that returns a `Criterion` object.
-    config = Criterion::default().significance_level(0.1).sample_size(3);
+    config = Criterion::default().significance_level(0.1).sample_size(2);
     targets = thread_pool_bench
 }
 criterion_main!(benches);
