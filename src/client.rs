@@ -29,7 +29,7 @@ impl Client {
         debug!("response of set({},{}) received: {}", key, val, ret);
         Ok(())
     }
-    pub fn remove(&mut self, key: String) -> Result<()> {
+    pub fn remove(&mut self, key: String) -> Result<bool> {
         self.writer.write(&[protocol::OP_RM])?;
         self.writer.write(key.as_bytes())?;
         self.writer.write(&['\n' as u8])?;
@@ -37,12 +37,11 @@ impl Client {
         let mut ret = String::new();
         self.reader.read_line(&mut ret)?;
         if ret.contains("Key not found") {
-            eprint!("{}", ret);
-            exit(1);
+            return Ok(false);
         }
-        Ok(())
+        Ok(true)
     }
-    pub fn get(&mut self, key: String) -> Result<()> {
+    pub fn get(&mut self, key: String) -> Result<String> {
         self.writer.write(&[protocol::OP_GET])?;
         self.writer.write(key.as_bytes())?;
         self.writer.write(&['\n' as u8])?;
@@ -53,20 +52,15 @@ impl Client {
             protocol::GET_VAL => {
                 let mut val = String::new();
                 self.reader.read_line(&mut val)?;
-                print!("{}", val);
+                Ok(val)
             }
-            protocol::GET_NIL => {
-                print!("Key not found");
-            }
+            protocol::GET_NIL => Ok("Key not found".to_owned()),
             protocol::GET_ERR => {
                 let mut err = String::new();
                 self.reader.read_line(&mut err)?;
-                println!("Err={}", err);
+                Ok(format!("Err={}", err))
             }
-            _ => {
-                println!("Err = Protocol error")
-            }
+            _ => Ok("Err = Protocol error".to_owned()),
         }
-        Ok(())
     }
 }

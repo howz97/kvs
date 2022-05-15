@@ -56,13 +56,19 @@ fn main() -> Result<()> {
         Some((CMD_GET, sub_m)) => {
             let mut client = Client::new(TcpStream::connect(sub_m.value_of("addr").unwrap())?);
             let key = sub_m.value_of(ARG_KEY).unwrap().to_owned();
-            client.get(key)?;
+            let content = client.get(key)?;
+            print!("{}", content);
             Ok(())
         }
         Some((CMD_RM, sub_m)) => {
             let mut client = Client::new(TcpStream::connect(sub_m.value_of("addr").unwrap())?);
             let key = sub_m.value_of(ARG_KEY).unwrap().to_owned();
-            client.remove(key)
+            let found = client.remove(key)?;
+            if !found {
+                eprint!("Key not found");
+                exit(1);
+            }
+            Ok(())
         }
         _ => {
             eprintln!("arguments needed, use --help to get more information");

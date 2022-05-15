@@ -12,6 +12,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::windows::fs::FileExt;
 use std::path::PathBuf;
 use std::result;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::thread;
 use std::thread::JoinHandle;
@@ -51,6 +52,7 @@ pub struct KvStore {
     writer: Arc<Mutex<Writer>>,
     table: Arc<DashMap<String, Index>>,
     compactor: Option<Compactor>,
+    uncompacted: Arc<AtomicU64>,
 }
 
 impl Clone for KvStore {
@@ -61,6 +63,7 @@ impl Clone for KvStore {
             writer: self.writer.clone(),
             table: self.table.clone(),
             compactor: None,
+            uncompacted: self.uncompacted.clone(),
         }
     }
 }
@@ -68,7 +71,6 @@ impl Clone for KvStore {
 struct Writer {
     file_id: u32,
     file: File,
-    uncompacted: u64,
 }
 
 struct Compactor {
@@ -127,7 +129,6 @@ impl KvStore {
         let w = Writer {
             file_id,
             file: new_active_file(&dir_path, file_id)?,
-            uncompacted,
         };
         handles.insert(file_id, w.file.try_clone()?);
 
@@ -137,6 +138,7 @@ impl KvStore {
             reader: Arc::new(RwLock::new(handles)),
             writer: Arc::new(Mutex::new(w)),
             compactor: None,
+            uncompacted: Arc::new(AtomicU64::new(uncompacted)),
         };
         let (sdr, rcv) = channel::bounded(0);
         // start compactor in backend
@@ -148,7 +150,8 @@ impl KvStore {
                     debug!("checking compaction");
                 },
             }
-            if cp.writer.lock().unwrap().uncompacted < COMPACT_THRESHOLD {
+            // Ordering::Relaxed is okey too
+            if cp.uncompacted.load(Ordering::Acquire) < COMPACT_THRESHOLD {
                 continue;
             }
             cp.compact()
@@ -213,11 +216,12 @@ impl KvStore {
         }
 
         // clean source files
+        let mut off: u64 = 0;
         let mut handles = self.reader.write().unwrap();
         for (id, _) in compact_src {
-            handles.remove(&id);
-            let path_src = kvs_path(&self.dir_path, id);
-            remove_file(path_src).unwrap();
+            let fh = handles.remove(&id).expect("file handle not exist");
+            off += fh.metadata().unwrap().len();
+            remove_file(kvs_path(&self.dir_path, id)).unwrap();
             debug!("file {}.kvs removed", id);
         }
         // adopt compacted file
@@ -225,6 +229,7 @@ impl KvStore {
         let path_dst = kvs_path(&self.dir_path, 1);
         rename(path, &path_dst).expect("compaction failed");
         let compacted = File::open(path_dst).unwrap();
+        off -= compacted.metadata().unwrap().len();
         handles.insert(1, compacted);
         for (key, old_f, old_pos, pos) in moved {
             if let Some(mut idx) = self.table.get_mut(&key) {
@@ -235,7 +240,8 @@ impl KvStore {
                 }
             }
         }
-        info!("finish compaction");
+        self.uncompacted.fetch_sub(off, Ordering::Relaxed);
+        info!("compaction finished, {} bytes disk freed", off);
     }
 
     // fn rename_active(&self) -> Result<PathBuf> {
@@ -301,7 +307,8 @@ impl KvsEngine for KvStore {
         let (len, offset) = append_entry(&mut w.file, Entry::put(key.clone(), val))?;
         let idx = Index::new(w.file_id, len, offset);
         if let Some(old) = self.table.insert(key, idx) {
-            w.uncompacted += 4 + old.len as u64;
+            self.uncompacted
+                .fetch_add(4 + old.len as u64, Ordering::Relaxed);
         }
         if offset + len as u64 >= SEGMENT_SIZE {
             self.cut(w);
@@ -327,8 +334,8 @@ impl KvsEngine for KvStore {
         let mut w = self.writer.lock().unwrap();
         let (_, old) = self.table.remove(&key).ok_or(MyErr::KeyNotFound)?;
         let (len, offset) = append_entry(&mut w.file, Entry::del(key))?;
-        w.uncompacted += 4 + old.len as u64;
-        w.uncompacted += 4 + len as u64;
+        let uncmpct = 4 + old.len as u64 + 4 + len as u64;
+        self.uncompacted.fetch_add(uncmpct, Ordering::Relaxed);
         if offset + len as u64 >= SEGMENT_SIZE {
             self.cut(w);
         }
