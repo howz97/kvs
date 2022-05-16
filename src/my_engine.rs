@@ -23,7 +23,7 @@ const SEGMENT_SIZE: u64 = 1 * 1024;
 const COMPACT_THRESHOLD: u64 = 2 * SEGMENT_SIZE;
 const COMPACT_CHECK: u64 = 1;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Index {
     file: u32,
     len: u32,
@@ -50,7 +50,8 @@ pub struct KvStore {
     dir_path: PathBuf,
     reader: Arc<RwLock<BTreeMap<u32, File>>>,
     writer: Arc<Mutex<Writer>>,
-    table: Arc<DashMap<String, Index>>,
+    // Lock order: reader -> indices (if both of them needed)
+    indices: Arc<DashMap<String, Index>>,
     compactor: Option<Compactor>,
     uncompacted: Arc<AtomicU64>,
 }
@@ -61,7 +62,7 @@ impl Clone for KvStore {
             dir_path: self.dir_path.clone(),
             reader: self.reader.clone(),
             writer: self.writer.clone(),
-            table: self.table.clone(),
+            indices: self.indices.clone(),
             compactor: None,
             uncompacted: self.uncompacted.clone(),
         }
@@ -134,7 +135,7 @@ impl KvStore {
 
         let mut store = KvStore {
             dir_path: dir_path,
-            table: Arc::new(table),
+            indices: Arc::new(table),
             reader: Arc::new(RwLock::new(handles)),
             writer: Arc::new(Mutex::new(w)),
             compactor: None,
@@ -192,22 +193,17 @@ impl KvStore {
             let compact_log = |offset, bytes: Vec<u8>| {
                 let ent: Entry = serde_json::from_slice(&bytes).expect("Unmarshal failed");
                 if ent.is_del {
-                    if !self.table.contains_key(&ent.key) {
+                    if !self.indices.contains_key(&ent.key) {
                         // maybe a put Entry exists in previous log
                         append_entry_2(&mut compact_dst, bytes).expect("failed to write");
                     }
                 } else {
-                    let mut keep = false;
-                    if let Some(idx) = self.table.get_mut(&ent.key) {
+                    if let Some(idx) = self.load_index(&ent.key) {
                         if idx.file == *id && idx.offset == offset {
-                            // release reference, then write to disk
-                            keep = true;
+                            let pos =
+                                append_entry_2(&mut compact_dst, bytes).expect("failed to write");
+                            moved.push((ent.key, *id, offset, pos));
                         }
-                    }
-                    if keep {
-                        let new_pos =
-                            append_entry_2(&mut compact_dst, bytes).expect("failed to write");
-                        moved.push((ent.key, *id, offset, new_pos));
                     }
                 }
             };
@@ -232,7 +228,7 @@ impl KvStore {
         off -= compacted.metadata().unwrap().len();
         handles.insert(1, compacted);
         for (key, old_f, old_pos, pos) in moved {
-            if let Some(mut idx) = self.table.get_mut(&key) {
+            if let Some(mut idx) = self.indices.get_mut(&key) {
                 // make sure index is unmodified
                 if idx.file == old_f && idx.offset == old_pos {
                     idx.file = 1;
@@ -242,6 +238,9 @@ impl KvStore {
         }
         self.uncompacted.fetch_sub(off, Ordering::Relaxed);
         info!("compaction finished, {} bytes disk freed", off);
+    }
+    fn load_index(&self, key: &String) -> Option<Index> {
+        self.indices.get(key).map(|idx| idx.clone())
     }
 
     // fn rename_active(&self) -> Result<PathBuf> {
@@ -306,7 +305,7 @@ impl KvsEngine for KvStore {
         let mut w = self.writer.lock().unwrap();
         let (len, offset) = append_entry(&mut w.file, Entry::put(key.clone(), val))?;
         let idx = Index::new(w.file_id, len, offset);
-        if let Some(old) = self.table.insert(key, idx) {
+        if let Some(old) = self.indices.insert(key, idx) {
             self.uncompacted
                 .fetch_add(4 + old.len as u64, Ordering::Relaxed);
         }
@@ -332,7 +331,7 @@ impl KvsEngine for KvStore {
     /// ```
     fn remove(&self, key: String) -> Result<()> {
         let mut w = self.writer.lock().unwrap();
-        let (_, old) = self.table.remove(&key).ok_or(MyErr::KeyNotFound)?;
+        let (_, old) = self.indices.remove(&key).ok_or(MyErr::KeyNotFound)?;
         let (len, offset) = append_entry(&mut w.file, Entry::del(key))?;
         let uncmpct = 4 + old.len as u64 + 4 + len as u64;
         self.uncompacted.fetch_add(uncmpct, Ordering::Relaxed);
@@ -341,7 +340,7 @@ impl KvsEngine for KvStore {
         }
         Ok(())
     }
-    /// Get value by key
+    /// Get value by key, sequential consistency is guaranteed
     ///
     /// # Example
     ///
@@ -359,16 +358,23 @@ impl KvsEngine for KvStore {
     /// # }
     /// ```
     fn get(&self, key: String) -> Result<Option<String>> {
-        let handles = self.reader.read().unwrap();
-        if let Some(idx) = self.table.get(&key) {
-            let file = handles.get(&idx.file).unwrap();
-            let mut ent = vec![0; idx.len as usize];
-            pread_exact(file, &mut ent, idx.offset)?;
-            let ent: Entry = serde_json::from_slice(&ent)?;
-            Ok(Some(ent.val))
-        } else {
-            return Ok(None);
-        }
+        let (file, len, offset) = {
+            let handles = self.reader.read().unwrap();
+            if let Some(idx) = self.indices.get(&key) {
+                (
+                    handles.get(&idx.file).unwrap().try_clone().unwrap(),
+                    idx.len,
+                    idx.offset,
+                )
+            } else {
+                return Ok(None);
+            }
+        };
+        // Read disk witout lock, trade consistency for performance
+        let mut bytes = vec![0; len as usize];
+        pread_exact(&file, &mut bytes, offset)?;
+        let ent: Entry = serde_json::from_slice(&bytes)?;
+        Ok(Some(ent.val))
     }
 }
 

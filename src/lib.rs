@@ -28,6 +28,7 @@ pub enum MyErr {
     InvalidArg,
     ErrExtension,
     WrongEngine,
+    FileNotFound(u32),
 }
 
 impl fmt::Display for MyErr {
@@ -37,6 +38,7 @@ impl fmt::Display for MyErr {
             MyErr::InvalidArg => write!(f, "Invalid argument"),
             MyErr::ErrExtension => write!(f, "Unexpected file extension"),
             MyErr::WrongEngine => write!(f, "Wrong engine detected"),
+            MyErr::FileNotFound(id) => write!(f, "File handle {} not found", id),
         }
     }
 }
