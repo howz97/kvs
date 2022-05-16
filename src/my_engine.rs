@@ -19,8 +19,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use tracing::{debug, info, trace};
 
-const SEGMENT_SIZE: u64 = 1 * 1024;
-const COMPACT_THRESHOLD: u64 = 2 * SEGMENT_SIZE;
+const SEGMENT_SIZE: u64 = 1024 * 1024;
+const COMPACT_THRESHOLD: u64 = 100 * SEGMENT_SIZE;
 const COMPACT_CHECK: u64 = 1;
 
 #[derive(Debug, Clone)]

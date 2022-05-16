@@ -259,7 +259,7 @@ fn engine_sled_bench(
 criterion_group! {
     name = benches;
     // This can be any expression that returns a `Criterion` object.
-    config = Criterion::default().significance_level(0.1).sample_size(2);
-    targets = thread_pool_bench
+    config = Criterion::default().significance_level(0.1).sample_size(30);
+    targets = engine_benchmark
 }
 criterion_main!(benches);
