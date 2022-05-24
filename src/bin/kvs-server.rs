@@ -1,5 +1,4 @@
 use clap::{Arg, Command};
-use crossbeam::channel;
 use kvs::server::run;
 use kvs::thread_pool::{SharedQueueThreadPool, ThreadPool};
 use kvs::{KvStore, MyErr, Result, SledKvsEngine};

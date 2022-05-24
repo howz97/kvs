@@ -2,7 +2,6 @@ use crate::protocol;
 use crate::Result;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::TcpStream;
-use std::process::exit;
 use tracing::debug;
 
 pub struct Client {
