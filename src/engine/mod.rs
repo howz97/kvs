@@ -1,7 +1,7 @@
-pub mod my_engine;
-pub mod sled_engine;
-pub use my_engine::KvStore;
-pub use sled_engine::SledKvsEngine;
+pub mod kvs_eng;
+pub mod sled_eng;
+pub use kvs_eng::KvStore;
+pub use sled_eng::SledKvsEngine;
 
 use crate::Result;
 use async_trait::async_trait;
