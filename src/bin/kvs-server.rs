@@ -1,18 +1,18 @@
 use clap::{Arg, Command};
 use crossbeam::channel;
-use kvs::my_engine;
 use kvs::server::run;
-use kvs::sled_engine::SledKvEngine;
 use kvs::thread_pool::{SharedQueueThreadPool, ThreadPool};
-use kvs::{MyErr, Result};
+use kvs::{KvStore, MyErr, Result, SledKvsEngine};
 use num_cpus;
 use std::fs::read_dir;
+use tokio;
 use tracing::{debug, error};
 use tracing_subscriber;
 
 const DEFAULT_DIR: &str = ".";
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let m = Command::new("kvs-server")
         .author(env!("CARGO_PKG_AUTHORS"))
@@ -56,11 +56,10 @@ fn main() -> Result<()> {
         addr,
         eng
     );
-    let (_, rcv) = channel::bounded(0);
     if eng == "kvs" {
-        run(addr, my_engine::KvStore::open(DEFAULT_DIR)?, pool, rcv)
+        run(addr, KvStore::open(DEFAULT_DIR, pool)?).await
     } else if eng == "sled" {
-        run(addr, SledKvEngine::open(DEFAULT_DIR)?, pool, rcv)
+        run(addr, SledKvsEngine::open(DEFAULT_DIR)?).await
     } else {
         panic!("never execute")
     }

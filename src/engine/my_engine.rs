@@ -1,26 +1,34 @@
+use crate::thread_pool::ThreadPool;
 use crate::{KvsEngine, MyErr, Result};
+use async_trait::async_trait;
 use crossbeam::{channel, select};
 use dashmap::DashMap;
+use failure;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::clone::Clone;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{read_dir, remove_file, rename, File};
+use std::future::Future;
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::windows::fs::FileExt;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::result;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::task::{Context, Poll};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
-use tracing::{debug, info, trace};
+use tokio::sync::oneshot;
+use tokio_stream::StreamExt;
+use tracing::{debug, error, info, trace};
 
-const SEGMENT_SIZE: u64 = 1024 * 1024;
-const COMPACT_THRESHOLD: u64 = 100 * SEGMENT_SIZE;
+const SEGMENT_SIZE: u64 = 1 * 1024;
+const COMPACT_THRESHOLD: u64 = 2 * SEGMENT_SIZE;
 const COMPACT_CHECK: u64 = 1;
 
 #[derive(Debug, Clone)]
@@ -46,41 +54,107 @@ impl fmt::Display for Index {
     }
 }
 
-pub struct KvStore {
+pub struct KvStore<ThreadPool> {
     dir_path: PathBuf,
-    reader: Arc<RwLock<BTreeMap<u32, File>>>,
+    reader: Reader,
     writer: Arc<Mutex<Writer>>,
-    // Lock order: reader -> indices (if both of them needed)
-    indices: Arc<DashMap<String, Index>>,
-    compactor: Option<Compactor>,
-    uncompacted: Arc<AtomicU64>,
+    compactor: Option<CompactorHandle>,
+    tp: Arc<Mutex<ThreadPool>>,
 }
 
-impl Clone for KvStore {
+impl<P: ThreadPool> Clone for KvStore<P> {
     fn clone(&self) -> Self {
         KvStore {
             dir_path: self.dir_path.clone(),
             reader: self.reader.clone(),
             writer: self.writer.clone(),
-            indices: self.indices.clone(),
             compactor: None,
-            uncompacted: self.uncompacted.clone(),
+            tp: self.tp.clone(),
         }
     }
 }
 
 struct Writer {
+    dir: PathBuf,
     file_id: u32,
     file: File,
+    indices: Arc<DashMap<String, Index>>,
+    reader: Arc<RwLock<BTreeMap<u32, File>>>,
+    uncompacted: Arc<AtomicU64>,
 }
 
-struct Compactor {
+impl Writer {
+    fn set(&mut self, key: String, val: String) -> Result<()> {
+        let (len, offset) = append_entry(&mut self.file, Entry::put(key.clone(), val))?;
+        let idx = Index::new(self.file_id, len, offset);
+        if let Some(old) = self.indices.insert(key, idx) {
+            self.uncompacted
+                .fetch_add(4 + old.len as u64, Ordering::Relaxed);
+        }
+        if offset + len as u64 >= SEGMENT_SIZE {
+            if let Err(err) = self.cut() {
+                error!("failed to cut {}", err);
+            }
+        }
+        Ok(())
+    }
+    fn remove(&mut self, key: String) -> Result<()> {
+        let (_, old) = self.indices.remove(&key).ok_or(MyErr::KeyNotFound)?;
+        let (len, offset) = append_entry(&mut self.file, Entry::del(key))?;
+        let uncmpct = 4 + old.len as u64 + 4 + len as u64;
+        self.uncompacted.fetch_add(uncmpct, Ordering::Relaxed);
+        if offset + len as u64 >= SEGMENT_SIZE {
+            if let Err(err) = self.cut() {
+                error!("failed to cut {}", err);
+            }
+        }
+        Ok(())
+    }
+    fn cut(&mut self) -> Result<()> {
+        self.file_id += 1;
+        self.file = new_active_file(&self.dir, self.file_id)?;
+        let mut reader = self.reader.write().unwrap();
+        reader.insert(self.file_id, self.file.try_clone()?);
+        Ok(())
+    }
+}
+
+// Lock order: handles -> indices (if both of them needed)
+#[derive(Clone)]
+struct Reader {
+    handles: Arc<RwLock<BTreeMap<u32, File>>>, // todo: lock-free
+    indices: Arc<DashMap<String, Index>>,
+}
+
+impl Reader {
+    fn get(&self, key: String) -> Result<Option<String>> {
+        let (file, len, offset) = {
+            let handles = self.handles.read().unwrap();
+            if let Some(idx) = self.indices.get(&key) {
+                (
+                    handles.get(&idx.file).unwrap().try_clone().unwrap(),
+                    idx.len,
+                    idx.offset,
+                )
+            } else {
+                return Ok(None);
+            }
+        };
+        // Read disk witout lock, trade consistency for performance
+        let mut bytes = vec![0; len as usize];
+        pread_exact(&file, &mut bytes, offset)?;
+        let ent: Entry = serde_json::from_slice(&bytes)?;
+        Ok(Some(ent.val))
+    }
+}
+
+struct CompactorHandle {
     handle: JoinHandle<()>,
     sender: channel::Sender<()>,
 }
 
-impl KvStore {
-    pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
+impl<P: ThreadPool> KvStore<P> {
+    pub fn open(path: impl Into<PathBuf>, tp: P) -> Result<Self> {
         let dir_path = path.into();
         let mut dir = read_dir(&dir_path)?
             .map(|res| res.map(|e| e.path()))
@@ -95,7 +169,6 @@ impl KvStore {
                 false
             })
             .collect::<result::Result<Vec<_>, io::Error>>()?;
-        debug!("total {} kvs files found", dir.len());
         dir.sort();
         let table = DashMap::new();
         let mut handles = BTreeMap::new();
@@ -127,23 +200,51 @@ impl KvStore {
             handles.insert(file_id, file);
         }
         file_id += 1;
-        let w = Writer {
-            file_id,
-            file: new_active_file(&dir_path, file_id)?,
-        };
-        handles.insert(file_id, w.file.try_clone()?);
-
+        let active = new_active_file(&dir_path, file_id)?;
+        handles.insert(file_id, active.try_clone()?);
+        let handles = Arc::new(RwLock::new(handles));
+        let indices = Arc::new(table);
+        let uncompacted = Arc::new(AtomicU64::new(uncompacted));
         let mut store = KvStore {
-            dir_path: dir_path,
-            indices: Arc::new(table),
-            reader: Arc::new(RwLock::new(handles)),
-            writer: Arc::new(Mutex::new(w)),
+            dir_path: dir_path.clone(),
+            reader: Reader {
+                handles: handles.clone(),
+                indices: indices.clone(),
+            },
+            writer: Arc::new(Mutex::new(Writer {
+                dir: dir_path.clone(),
+                file_id,
+                file: active,
+                indices: indices.clone(),
+                reader: handles.clone(),
+                uncompacted: uncompacted.clone(),
+            })),
             compactor: None,
-            uncompacted: Arc::new(AtomicU64::new(uncompacted)),
+            tp: Arc::new(Mutex::new(tp)),
         };
+        let compactor = Compactor {
+            dir_path: dir_path,
+            reader: handles,
+            indices: indices,
+            uncompacted: uncompacted,
+        };
+        store.compactor = Some(compactor.run());
+        Ok(store)
+    }
+}
+
+struct Compactor {
+    dir_path: PathBuf,
+    reader: Arc<RwLock<BTreeMap<u32, File>>>, // todo: lock-free
+    // Lock order: reader -> indices (if both of them needed)
+    indices: Arc<DashMap<String, Index>>,
+    uncompacted: Arc<AtomicU64>,
+}
+
+impl Compactor {
+    fn run(self) -> CompactorHandle {
         let (sdr, rcv) = channel::bounded(0);
-        // start compactor in backend
-        let cp = store.clone();
+        // run compactor in backend
         let h = thread::spawn(move || loop {
             select! {
                 recv(rcv) -> _ => break,
@@ -151,23 +252,15 @@ impl KvStore {
                     debug!("checking compaction");
                 },
             }
-            // Ordering::Relaxed is okey too
-            if cp.uncompacted.load(Ordering::Acquire) < COMPACT_THRESHOLD {
+            if self.uncompacted.load(Ordering::Acquire) < COMPACT_THRESHOLD {
                 continue;
             }
-            cp.compact()
+            self.compact()
         });
-        store.compactor = Some(Compactor {
+        CompactorHandle {
             handle: h,
             sender: sdr,
-        });
-        Ok(store)
-    }
-    fn cut(&self, mut writer: MutexGuard<Writer>) {
-        writer.file_id += 1;
-        writer.file = new_active_file(&self.dir_path, writer.file_id).unwrap();
-        let mut reader = self.reader.write().unwrap();
-        reader.insert(writer.file_id, writer.file.try_clone().unwrap());
+        }
     }
     fn compact(&self) {
         let path = path_push(&self.dir_path, "compacting");
@@ -182,8 +275,7 @@ impl KvStore {
             let mut tk = hanldes.iter().take(2);
             let mut c: Vec<(u32, File)> = Vec::new();
             while let Some((&id, file)) = tk.next() {
-                let file = file.try_clone().expect("failed to clone file");
-                c.push((id, file));
+                c.push((id, file.try_clone().unwrap()));
             }
             c
         };
@@ -210,13 +302,12 @@ impl KvStore {
             debug!("start to compact file {}.kvs", id);
             iter_entries_2(file, compact_log);
         }
-
         // clean source files
         let mut off: u64 = 0;
         let mut handles = self.reader.write().unwrap();
-        for (id, _) in compact_src {
-            let fh = handles.remove(&id).expect("file handle not exist");
-            off += fh.metadata().unwrap().len();
+        for (id, src) in compact_src {
+            off += src.metadata().unwrap().len();
+            handles.remove(&id).expect("file handle not exist");
             remove_file(kvs_path(&self.dir_path, id)).unwrap();
             debug!("file {}.kvs removed", id);
         }
@@ -242,18 +333,9 @@ impl KvStore {
     fn load_index(&self, key: &String) -> Option<Index> {
         self.indices.get(key).map(|idx| idx.clone())
     }
-
-    // fn rename_active(&self) -> Result<PathBuf> {
-    //     let mut from = self.dir_path.clone();
-    //     from.push("active.kvs");
-    //     let mut to = self.dir_path.clone();
-    //     to.push(format!("{}.kvs", self.active_id));
-    //     rename(from, to.clone())?;
-    //     Ok(to)
-    // }
 }
 
-impl Drop for KvStore {
+impl<ThreadPool> Drop for KvStore<ThreadPool> {
     fn drop(&mut self) {
         if let Some(c) = self.compactor.take() {
             c.sender
@@ -286,95 +368,37 @@ fn path_push(dir: &PathBuf, f: &str) -> PathBuf {
     dir
 }
 
-impl KvsEngine for KvStore {
+#[async_trait]
+impl<P: ThreadPool> KvsEngine for KvStore<P> {
     /// Insert/Update key-value
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # use kvs::{Result, KvsEngine};
-    /// # use kvs::my_engine::KvStore;
-    /// # use tempfile::TempDir;
-    /// # fn main() -> Result<()> {
-    /// #   let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    /// #   let mut store = KvStore::open(temp_dir.path())?;
-    /// #   store.set("a".to_string(), "A".to_string())
-    /// # }
-    /// ```
-    fn set(&self, key: String, val: String) -> Result<()> {
-        let mut w = self.writer.lock().unwrap();
-        let (len, offset) = append_entry(&mut w.file, Entry::put(key.clone(), val))?;
-        let idx = Index::new(w.file_id, len, offset);
-        if let Some(old) = self.indices.insert(key, idx) {
-            self.uncompacted
-                .fetch_add(4 + old.len as u64, Ordering::Relaxed);
-        }
-        if offset + len as u64 >= SEGMENT_SIZE {
-            self.cut(w);
-        }
-        Ok(())
+    async fn set(self, key: String, val: String) -> Result<()> {
+        let (sdr, rcv) = oneshot::channel();
+        let w = self.writer.clone();
+        self.tp.lock().unwrap().spawn(move || {
+            let rlt = w.lock().unwrap().set(key, val);
+            sdr.send(rlt).expect("oneshot send failed");
+        });
+        rcv.await?
     }
     /// Remove value by key
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # use kvs::{Result, KvsEngine};
-    /// # use kvs::my_engine::KvStore;
-    /// # use tempfile::TempDir;
-    /// # fn main() -> Result<()> {
-    /// #   let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    /// #   let mut store = KvStore::open(temp_dir.path())?;
-    /// #   store.set("a".to_string(), "A".to_string())?;
-    /// #   store.remove("a".to_string())
-    /// # }
-    /// ```
-    fn remove(&self, key: String) -> Result<()> {
-        let mut w = self.writer.lock().unwrap();
-        let (_, old) = self.indices.remove(&key).ok_or(MyErr::KeyNotFound)?;
-        let (len, offset) = append_entry(&mut w.file, Entry::del(key))?;
-        let uncmpct = 4 + old.len as u64 + 4 + len as u64;
-        self.uncompacted.fetch_add(uncmpct, Ordering::Relaxed);
-        if offset + len as u64 >= SEGMENT_SIZE {
-            self.cut(w);
-        }
-        Ok(())
+    async fn remove(self, key: String) -> Result<()> {
+        let (sdr, rcv) = oneshot::channel();
+        let w = self.writer.clone();
+        self.tp.lock().unwrap().spawn(move || {
+            let rlt = w.lock().unwrap().remove(key);
+            sdr.send(rlt).expect("oneshot send failed");
+        });
+        rcv.await?
     }
     /// Get value by key, sequential consistency is guaranteed
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # use kvs::{Result, KvsEngine};
-    /// # use kvs::my_engine::KvStore;
-    /// # use tempfile::TempDir;
-    /// # fn main() -> Result<()> {
-    /// #   let temp_dir = TempDir::new().expect("unable to create temporary working directory");
-    /// #   let mut store = KvStore::open(temp_dir.path())?;
-    /// #   if let Some(v) = store.get("a".to_string())? {
-    /// #       println!("{}", v)
-    /// #   }
-    /// #   Ok(())
-    /// # }
-    /// ```
-    fn get(&self, key: String) -> Result<Option<String>> {
-        let (file, len, offset) = {
-            let handles = self.reader.read().unwrap();
-            if let Some(idx) = self.indices.get(&key) {
-                (
-                    handles.get(&idx.file).unwrap().try_clone().unwrap(),
-                    idx.len,
-                    idx.offset,
-                )
-            } else {
-                return Ok(None);
-            }
-        };
-        // Read disk witout lock, trade consistency for performance
-        let mut bytes = vec![0; len as usize];
-        pread_exact(&file, &mut bytes, offset)?;
-        let ent: Entry = serde_json::from_slice(&bytes)?;
-        Ok(Some(ent.val))
+    async fn get(self, key: String) -> Result<Option<String>> {
+        let (sdr, rcv) = oneshot::channel();
+        let r = self.reader.clone();
+        self.tp.lock().unwrap().spawn(move || {
+            let rlt = r.get(key);
+            sdr.send(rlt).expect("oneshot send failed");
+        });
+        rcv.await?
     }
 }
 

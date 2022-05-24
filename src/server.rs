@@ -1,115 +1,96 @@
 use crate::protocol;
 use crate::thread_pool::ThreadPool;
 use crate::{KvsEngine, Result};
-use crossbeam::channel::Receiver;
 use std::io::{self, BufRead, Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info};
 
 static X: &[char] = &['\n', '\t', ' '];
 
-pub fn run<E: KvsEngine, P: ThreadPool>(
-    addr: &str,
-    engine: E,
-    pool: P,
-    shutdown: Receiver<()>,
-) -> Result<()> {
+pub async fn run<E: KvsEngine>(addr: &str, engine: E) -> Result<()> {
     info!("kvs-server is running...");
-    let listener = TcpListener::bind(addr)?;
-    for stream in listener.incoming() {
-        if shutdown.try_recv().is_ok() {
-            debug!("server received shutdown command!");
-            break;
-        }
-        let stream = stream?;
+    let listener = TcpListener::bind(addr).await?;
+    loop {
+        let (stream, addr) = listener.accept().await?;
         let eng = engine.clone();
-        debug!("start serving client");
-        pool.spawn(move || {
-            if let Err(e) = handler(stream, eng) {
-                error!("error on serving client: {}", e)
-            }
-        });
+        debug!("connected socket {}", addr);
+        tokio::spawn(handler(stream, eng));
     }
-    Ok(())
 }
 
-pub fn handler<E: KvsEngine>(stream: TcpStream, eng: E) -> Result<()> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(1)))
-        .expect("failed to set read timeout");
-    stream
-        .set_write_timeout(Some(Duration::from_secs(1)))
-        .expect("failed to set write timeout");
-    let mut reader = io::BufReader::new(&stream);
-    let mut writer = io::BufWriter::new(&stream);
-    let mut op = [0; 1];
-    reader.read_exact(&mut op)?;
-    match *op.get(0).unwrap() {
+pub async fn handler<E: KvsEngine>(mut stream: TcpStream, eng: E) -> Result<()> {
+    let (reader, writer) = stream.split();
+    let mut reader = BufReader::with_capacity(1024, reader);
+    let mut writer = BufWriter::with_capacity(1024, writer);
+    match reader.read_u8().await? {
         protocol::OP_SET => {
             let mut key = String::new();
-            reader.read_line(&mut key)?;
+            reader.read_line(&mut key).await?;
             key = key.trim_matches(X).to_owned();
             if key.len() == 0 {
-                writer.write_all("ErrNoKey\n".as_bytes())?;
+                writer.write_all("ErrNoKey\n".as_bytes()).await?;
                 return Ok(());
             }
             let mut val = String::new();
-            reader.read_line(&mut val)?;
+            reader.read_line(&mut val).await?;
             val = val.trim_matches(X).to_owned();
             if val.len() == 0 {
-                writer.write_all("ErrNoVal\n".as_bytes())?;
+                writer.write_all("ErrNoVal\n".as_bytes()).await?;
                 return Ok(());
             }
-            if let Err(_) = eng.set(key, val) {
-                writer.write_all("ErrInternal\n".as_bytes())?;
+            if let Err(_) = eng.set(key, val).await {
+                writer.write_all("ErrInternal\n".as_bytes()).await?;
             } else {
-                writer.write_all("OK\n".as_bytes())?;
+                writer.write_all("OK\n".as_bytes()).await?;
             }
         }
         protocol::OP_RM => {
             let mut key = String::new();
-            reader.read_line(&mut key)?;
+            reader.read_line(&mut key).await?;
             key = key.trim_matches(X).to_owned();
             if key.len() == 0 {
-                writer.write_all("ErrNoKey\n".as_bytes())?;
+                writer.write_all("ErrNoKey\n".as_bytes()).await?;
                 return Ok(());
             }
             debug!("Removing {}", key);
-            if let Err(e) = eng.remove(key) {
-                writer.write_all(e.to_string().as_bytes())?;
-                writer.write_all(&['\n' as u8])?;
+            if let Err(e) = eng.remove(key).await {
+                writer.write_all(e.to_string().as_bytes()).await?;
+                writer.write_all(&['\n' as u8]).await?;
             } else {
-                writer.write_all("OK\n".as_bytes())?;
+                writer.write_all("OK\n".as_bytes()).await?;
             }
         }
         protocol::OP_GET => {
             let mut key = String::new();
-            reader.read_line(&mut key)?;
+            reader.read_line(&mut key).await?;
             key = key.trim_matches(X).to_owned();
             if key.len() == 0 {
-                writer.write_all(&[protocol::GET_ERR])?;
-                writer.write_all("ErrNoKey\n".as_bytes())?;
+                writer.write_u8(protocol::GET_ERR).await?;
+                writer.write_all("ErrNoKey\n".as_bytes()).await?;
                 return Ok(());
             }
-            let res = eng.get(key);
+            debug!("OP_GET key={}", key);
+            let res = eng.get(key).await;
             if let Err(e) = res {
-                error!("OP_GET: {}", e);
-                writer.write_all(&[protocol::GET_ERR])?;
-                writer.write_all("ErrInternal\n".as_bytes())?;
+                error!("OP_GET: err={}", e);
+                writer.write_u8(protocol::GET_ERR).await?;
+                writer.write_all("ErrInternal\n".as_bytes()).await?;
             } else {
                 if let Some(v) = res.unwrap() {
-                    writer.write_all(&[protocol::GET_VAL])?;
-                    writer.write_all(v.as_bytes())?;
+                    writer.write_u8(protocol::GET_VAL).await?;
+                    writer.write_all(v.as_bytes()).await?;
                 } else {
-                    writer.write_all(&[protocol::GET_NIL])?;
+                    writer.write_u8(protocol::GET_NIL).await?;
                 }
-                writer.write_all(&['\n' as u8])?;
+                writer.write_u8('\n' as u8).await?;
             }
         }
         _ => {
-            writer.write_all("ErrOp\n".as_bytes())?;
+            panic!("unknown operation");
         }
     }
+    writer.flush().await?;
     Ok(())
 }

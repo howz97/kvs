@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use tracing::{debug, error, trace};
 
-pub trait ThreadPool {
+pub trait ThreadPool: Send + 'static {
     fn new(threads: u32) -> Result<Self>
     where
         Self: Sized;
@@ -42,7 +42,7 @@ pub struct SharedQueueThreadPool {
 impl ThreadPool for SharedQueueThreadPool {
     fn new(threads: u32) -> Result<Self> {
         debug!("creating thread pool, size={}", threads);
-        let (sdr, rcv) = channel::bounded(0);
+        let (sdr, rcv) = channel::bounded(1024);
         let rcv = Arc::new(Mutex::new(rcv));
         let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
         for id in 0..threads {

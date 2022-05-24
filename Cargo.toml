@@ -21,6 +21,9 @@ crossbeam = "0.8"
 num_cpus = "1.13"
 rayon = "1.5"
 dashmap = "5.3"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = {version= "0.1", features = ["fs"]}
+async-trait = "0.1"
 
 [dev-dependencies]
 assert_cmd = "0.11"
