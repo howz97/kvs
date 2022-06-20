@@ -1,24 +1,27 @@
-use crate::thread_pool::ThreadPool;
-use crate::{KvsEngine, MyErr, Result};
+use crate::{thread_pool::ThreadPool, KvsEngine, MyErr, Result};
+
+use std::{
+    clone::Clone,
+    collections::BTreeMap,
+    fmt,
+    fs::{read_dir, remove_file, rename, File},
+    io::{self, Read, Seek, SeekFrom, Write},
+    os::windows::fs::FileExt,
+    path::PathBuf,
+    result,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, RwLock,
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
+};
+
 use async_trait::async_trait;
 use crossbeam::{channel, select};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json;
-use std::clone::Clone;
-use std::collections::BTreeMap;
-use std::fmt;
-use std::fs::{read_dir, remove_file, rename, File};
-use std::io;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::windows::fs::FileExt;
-use std::path::PathBuf;
-use std::result;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::thread;
-use std::thread::JoinHandle;
-use std::time::Duration;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, trace};
 
@@ -63,6 +66,7 @@ impl<P: ThreadPool> Clone for KvStore<P> {
             dir_path: self.dir_path.clone(),
             reader: self.reader.clone(),
             writer: self.writer.clone(),
+            // only the KvStore in main loop hold compactor handle
             compactor: None,
             tp: self.tp.clone(),
         }
@@ -151,6 +155,7 @@ struct CompactorHandle {
 impl<P: ThreadPool> KvStore<P> {
     pub fn open(path: impl Into<PathBuf>, tp: P) -> Result<Self> {
         let dir_path = path.into();
+        // load kvs file list
         let mut dir = read_dir(&dir_path)?
             .map(|res| res.map(|e| e.path()))
             .filter(|res| {
@@ -165,6 +170,7 @@ impl<P: ThreadPool> KvStore<P> {
             })
             .collect::<result::Result<Vec<_>, io::Error>>()?;
         dir.sort();
+        // load key-value entries
         let table = DashMap::new();
         let mut handles = BTreeMap::new();
         let mut file_id: u32 = 0;
@@ -194,6 +200,7 @@ impl<P: ThreadPool> KvStore<P> {
             iter_entries(&mut file, load_entry);
             handles.insert(file_id, file);
         }
+        // initialize data structure
         file_id += 1;
         let active = new_active_file(&dir_path, file_id)?;
         handles.insert(file_id, active.try_clone()?);
@@ -217,6 +224,7 @@ impl<P: ThreadPool> KvStore<P> {
             compactor: None,
             tp: Arc::new(Mutex::new(tp)),
         };
+        // run comoactor in background
         let compactor = Compactor {
             dir_path: dir_path,
             reader: handles,
@@ -226,6 +234,25 @@ impl<P: ThreadPool> KvStore<P> {
         store.compactor = Some(compactor.run());
         Ok(store)
     }
+}
+
+fn iter_entries<F: FnMut(u64, Vec<u8>)>(file: &mut File, mut f: F) {
+    let file_len = file.metadata().unwrap().len();
+    let mut offset: u64 = file.seek(SeekFrom::Start(0)).unwrap();
+    while offset < file_len {
+        let ent = read_entry(file).expect("failed to read entry");
+        f(offset + 4, ent);
+        offset = file.stream_position().unwrap();
+    }
+}
+
+fn read_entry(file: &mut File) -> Result<Vec<u8>> {
+    let mut length = [0; 4];
+    file.read_exact(&mut length)?;
+    let length = u32::from_be_bytes(length);
+    let mut ent = vec![0; length as usize];
+    file.read_exact(&mut ent)?;
+    Ok(ent)
 }
 
 struct Compactor {
@@ -282,20 +309,20 @@ impl Compactor {
                 if ent.is_del {
                     if !self.indices.contains_key(&ent.key) {
                         // maybe a put Entry exists in previous log
-                        append_entry_2(&mut compact_dst, bytes).expect("failed to write");
+                        append_entry_bytes(&mut compact_dst, bytes).expect("failed to write");
                     }
                 } else {
                     if let Some(idx) = self.load_index(&ent.key) {
                         if idx.file == *id && idx.offset == offset {
-                            let pos =
-                                append_entry_2(&mut compact_dst, bytes).expect("failed to write");
+                            let pos = append_entry_bytes(&mut compact_dst, bytes)
+                                .expect("failed to write");
                             moved.push((ent.key, *id, offset, pos));
                         }
                     }
                 }
             };
             debug!("start to compact file {}.kvs", id);
-            iter_entries_2(file, compact_log);
+            concurrent_iter_entries(file, compact_log);
         }
         // clean source files
         let mut off: u64 = 0;
@@ -330,8 +357,41 @@ impl Compactor {
     }
 }
 
+fn concurrent_iter_entries<F: FnMut(u64, Vec<u8>)>(file: &File, mut f: F) {
+    let file_len = file.metadata().unwrap().len();
+    let mut offset = 0;
+    while offset < file_len {
+        let mut length = [0; 4];
+        pread_exact(file, &mut length, offset).unwrap();
+        offset += 4;
+        let length = u32::from_be_bytes(length);
+        let mut ent = vec![0; length as usize];
+        pread_exact(file, &mut ent, offset).unwrap();
+        f(offset, ent);
+        offset += length as u64;
+    }
+}
+
+fn pread_exact(file: &File, mut buf: &mut [u8], mut offset: u64) -> Result<()> {
+    while buf.len() > 0 {
+        let r = file.seek_read(buf, offset)?;
+        buf = &mut buf[r..];
+        offset += r as u64;
+    }
+    Ok(())
+}
+
+fn append_entry_bytes(file: &mut File, ent: Vec<u8>) -> Result<u64> {
+    let len = ent.len() as u32;
+    file.write_all(&len.to_be_bytes())?;
+    let offset = file.metadata().unwrap().len();
+    file.write_all(&ent)?;
+    Ok(offset)
+}
+
 impl<ThreadPool> Drop for KvStore<ThreadPool> {
     fn drop(&mut self) {
+        // kill compactor
         if let Some(c) = self.compactor.take() {
             c.sender
                 .send(())
@@ -397,66 +457,6 @@ impl<P: ThreadPool> KvsEngine for KvStore<P> {
     }
 }
 
-fn iter_entries_2<F: FnMut(u64, Vec<u8>)>(file: &File, mut f: F) {
-    let file_len = file.metadata().unwrap().len();
-    let mut offset = 0;
-    while offset < file_len {
-        let mut length = [0; 4];
-        pread_exact(file, &mut length, offset).unwrap();
-        offset += 4;
-        let length = u32::from_be_bytes(length);
-        let mut ent = vec![0; length as usize];
-        pread_exact(file, &mut ent, offset).unwrap();
-        f(offset, ent);
-        offset += length as u64;
-    }
-}
-
-fn pread_exact(file: &File, mut buf: &mut [u8], mut offset: u64) -> Result<()> {
-    while buf.len() > 0 {
-        let r = file.seek_read(buf, offset)?;
-        buf = &mut buf[r..];
-        offset += r as u64;
-    }
-    Ok(())
-}
-
-fn iter_entries<F: FnMut(u64, Vec<u8>)>(file: &mut File, mut f: F) {
-    let file_len = file.metadata().unwrap().len();
-    let mut offset: u64 = file.seek(SeekFrom::Start(0)).unwrap();
-    while offset < file_len {
-        let ent = read_entry(file).expect("failed to read entry");
-        f(offset + 4, ent);
-        offset = file.stream_position().unwrap();
-    }
-}
-
-fn read_entry(file: &mut File) -> Result<Vec<u8>> {
-    let mut length = [0; 4];
-    file.read_exact(&mut length)?;
-    let length = u32::from_be_bytes(length);
-    let mut ent = vec![0; length as usize];
-    file.read_exact(&mut ent)?;
-    Ok(ent)
-}
-
-fn append_entry_2(file: &mut File, ent: Vec<u8>) -> Result<u64> {
-    let len = ent.len() as u32;
-    file.write_all(&len.to_be_bytes())?;
-    let offset = file.metadata().unwrap().len();
-    file.write_all(&ent)?;
-    Ok(offset)
-}
-
-fn append_entry(file: &mut File, ent: Entry) -> Result<(u32, u64)> {
-    let ent = serde_json::to_vec(&ent)?;
-    let len = ent.len() as u32;
-    file.write_all(&len.to_be_bytes())?;
-    let offset = file.metadata().unwrap().len();
-    file.write_all(&ent)?;
-    Ok((len, offset))
-}
-
 #[derive(Serialize, Deserialize, Debug)]
 struct Entry {
     key: String,
@@ -474,4 +474,13 @@ impl Entry {
         let is_del = true;
         Entry { key, val, is_del }
     }
+}
+
+fn append_entry(file: &mut File, ent: Entry) -> Result<(u32, u64)> {
+    let ent = serde_json::to_vec(&ent)?;
+    let len = ent.len() as u32;
+    file.write_all(&len.to_be_bytes())?;
+    let offset = file.metadata().unwrap().len();
+    file.write_all(&ent)?;
+    Ok((len, offset))
 }
